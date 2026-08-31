@@ -1,9 +1,9 @@
-import sys, zipfile, shutil, os, urllib.error, subprocess, traceback, tarfile, asyncio, re
+import sys, zipfile, shutil, os, urllib.error, subprocess, traceback, tarfile, asyncio, re, importlib
 from dataclasses import dataclass
 from urllib.request import urlretrieve
 
 
-VERSION: str = "26.49"
+VERSION: str = "26.50"
 CLI_RESET: str = "\033[0m"
 CLI_BOLD: str = "\033[1m"
 CLI_DIM: str = "\033[90m"
@@ -601,15 +601,17 @@ def _run_staged_command(command: str) -> None:
         raise SystemExit(result.returncode)
 
 
-def _queue_install_to_root(pub: str, rel: str, install_root: str, reinstall: bool = True, work_dir: str = ".") -> asyncio.Task:
+def _queue_install_to_root(pub: str, rel: str, install_root: str, reinstall: bool = True, work_dir: str = ".", emit: bool = True) -> asyncio.Task:
     resolved_pub: str = parsepub(pub)
     key: tuple[str, str, str] = (resolved_pub.lower(), rel, os.path.realpath(install_root))
     if key in running_installs:
-        _print_status("wait", f"Already queued {resolved_pub.lower()} {rel} -> {install_root}", "muted")
+        if emit:
+            _print_status("wait", f"Already queued {resolved_pub.lower()} {rel} -> {install_root}", "muted")
         return running_installs[key]
 
-    _print_status("queue", f"{resolved_pub.lower()} {rel} -> {install_root}", "info")
-    task: asyncio.Task = asyncio.create_task(asyncio.to_thread(_install_publication_to_root, resolved_pub, rel, install_root, reinstall, work_dir))
+    if emit:
+        _print_status("queue", f"{resolved_pub.lower()} {rel} -> {install_root}", "info")
+    task: asyncio.Task = asyncio.create_task(asyncio.to_thread(_install_publication_to_root, resolved_pub, rel, install_root, reinstall, work_dir, emit))
     running_installs[key] = task
 
     def cleanup(completed_task: asyncio.Task, install_key: tuple[str, str, str] = key) -> None:
@@ -1159,7 +1161,7 @@ async def _reinstall_project_libraries(project: str) -> None:
 def _install_publication(pub: str, rel: str, reinstall: bool = True) -> InstallResult:
     return _install_publication_to_root(pub, rel, "ww", reinstall)
 
-def _install_publication_to_root(pub: str, rel: str, install_root: str, reinstall: bool = True, work_dir: str = ".") -> InstallResult:
+def _install_publication_to_root(pub: str, rel: str, install_root: str, reinstall: bool = True, work_dir: str = ".", emit: bool = True) -> InstallResult:
     pub = parsepub(pub)
     pub_lower: str = pub.lower()
     dirname: str = os.path.join(install_root, _publication_leaf(pub, rel))
@@ -1169,6 +1171,8 @@ def _install_publication_to_root(pub: str, rel: str, install_root: str, reinstal
     url: str = f"https://github.com/Wednesware/{pub.capitalize()}/archive/refs/heads/main.zip" if rel == "beta" else f"https://github.com/Wednesware/{pub.capitalize()}/releases/{rel + '/download' if rel == 'latest' else 'download/' + rel}/{pub_lower}.zip"
     try:
         if os.path.exists(dirname) and not reinstall:
+            if emit:
+                _print_status("info", f"{pub_lower} {rel}: Publication is already installed.", "muted")
             return InstallResult("info", [f"{pub_lower} {rel}: Publication is already installed."])
         os.makedirs(work_dir, exist_ok=True)
         try:
@@ -1191,6 +1195,8 @@ def _install_publication_to_root(pub: str, rel: str, install_root: str, reinstal
 
         source_root: str = next(os.scandir(extract_dir)).name
         shutil.move(os.path.join(extract_dir, source_root, pub_lower), dirname)
+        if emit:
+            _print_status("done", f"{pub_lower} {rel}: Installation complete!", "success")
         return InstallResult("success", [f"{pub_lower} {rel}: Installation complete!"])
     except Exception:
         return InstallResult(
@@ -1205,12 +1211,12 @@ def _install_publication_to_root(pub: str, rel: str, install_root: str, reinstal
             os.remove(archive_path)
 
 
-def _queue_install(pub: str, rel: str, reinstall: bool = True, install_root: str = "ww", work_dir: str = ".") -> asyncio.Task:
-    return _queue_install_to_root(pub, rel, install_root, reinstall, work_dir)
+def _queue_install(pub: str, rel: str, reinstall: bool = True, install_root: str = "ww", work_dir: str = ".", emit: bool = True) -> asyncio.Task:
+    return _queue_install_to_root(pub, rel, install_root, reinstall, work_dir, emit)
 
 
 async def install_async(pub: str, rel: str, reinstall: bool = True, color: bool = True, emit: bool = True, fatal: bool = True, install_root: str = "ww", work_dir: str = ".") -> InstallResult:
-    result: InstallResult = await _queue_install(pub, rel, reinstall, install_root, work_dir)
+    result: InstallResult = await _queue_install(pub, rel, reinstall, install_root, work_dir, emit)
     if emit:
         _print_install_result(result, color)
     if fatal and result.exit_code:
@@ -1306,14 +1312,18 @@ async def getdep_everywhere(path: str, color: bool = True, force: bool = False, 
         await _getdep_recursive(dep_file, color=color, log=True, visited=visited, installed=installed, force=force, install_root=install_root, work_dir=work_dir)
 
 
-async def _install_subdependencies(pub: str, rel: str, color: bool = True, install_root: str = "ww", work_dir: str = ".") -> None:
+async def _install_subdependencies(pub: str, rel: str, color: bool = True, install_root: str = "ww", work_dir: str = ".", emit: bool = True) -> None:
     resolved_pub: str = parsepub(pub)
     dep_path: str = _dependency_file_path(_publication_dirname(resolved_pub, rel, install_root))
-    _print_status("deps", f"Checking sub-dependencies for {resolved_pub.lower()} {rel}", "info")
+    if emit:
+        _print_status("deps", f"Checking sub-dependencies for {resolved_pub.lower()} {rel}", "info")
     if not os.path.isfile(dep_path):
-        _print_status("info", "No sub-dependencies declared.", "muted")
+        if emit:
+            _print_status("info", "No sub-dependencies declared.", "muted")
         return
-    await getdep(dep_path, color=color, log=True, install_root=install_root, work_dir=work_dir)
+    await getdep(dep_path, color=color, log=emit, install_root=install_root, work_dir=work_dir)
+    if emit:
+        _print_status("done", f"Sub-dependencies for {resolved_pub.lower()} {rel} are ready.", "success")
         
 def trust(ext_filename: str, ext_dir_path: str) -> None:
     ext_path: str = os.path.join(EXTENSIONS_DIR, ext_filename)
@@ -1715,6 +1725,18 @@ async def main() -> None:
                                 print(_cli(f"  {line}", CLI_ERROR))
             _print_status("miss", f"Unknown command: {sys.argv[1]}", "warning")
             print(f"Run {_cli('n2 help', CLI_INFO)} for a list of commands.")
+            
+async def require_async(pub: str, rel: str | None = None) -> None:
+    pub, submodule = [pub, None] if len(pub.split(".", 1)) == 1 else pub.split(".", 1)
+    pub = PUBLICATION_CACHE.get(pub, pub)
+    rel = rel or "latest"
+    result: InstallResult = await install_async(pub, rel, reinstall=False, emit=False)
+    if not result.exit_code:
+        await _install_subdependencies(pub, rel, emit=False)
+    return importlib.import_module(f"ww.{REVERSE_PUBLICATION_CACHE[pub]}{rel if rel != 'latest' else ''}{'.' + submodule if submodule else ''}")
+
+def require(pub: str, rel: str | None = None) -> None:
+    return asyncio.run(require_async(pub, rel))
             
 def entrypoint() -> None:
     asyncio.run(main())

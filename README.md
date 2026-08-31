@@ -1,4 +1,6 @@
-# Wednesware Nitrogen
+[![Wednesware](wednesware.png)](https://wednesware.org)
+
+# Nitrogen
 
 Easy, ultra-lightweight installer for Wednesware publications.
 
