@@ -2,7 +2,7 @@
 
 # Nitrogen
 
-Easy, ultra-lightweight installer for Wednesware publications.
+Fast installer for Wednesware publications.
 
 ## Installation methods:
 
