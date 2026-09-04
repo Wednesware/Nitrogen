@@ -1,9 +1,9 @@
-import sys, zipfile, shutil, os, urllib.error, subprocess, traceback, tarfile, asyncio, re, importlib
+import sys, zipfile, shutil, os, urllib.error, subprocess, traceback, tarfile, asyncio, re, importlib, types, json, sysconfig
 from dataclasses import dataclass
 from urllib.request import urlretrieve
 
 
-VERSION: str = "26.50"
+VERSION: str = "26.51"
 CLI_RESET: str = "\033[0m"
 CLI_BOLD: str = "\033[1m"
 CLI_DIM: str = "\033[90m"
@@ -63,12 +63,180 @@ REVERSE_PUBLICATION_CACHE: dict[str, str] = {v: k for k, v in PUBLICATION_CACHE.
 EXTENSIONS_DIR: str = os.path.join(os.path.dirname(__file__), "extensions")
 TRUSTED_EXTENSIONS_FILE: str = os.path.join(os.path.dirname(__file__), ".TRUSTED_EXTENSIONS")
 LEN_PATH: str = os.path.join(os.path.dirname(__file__), "ww", "len")
-NITROSTAGED_FILE: str = ".nitrostaged"
 # "internal" installs live inside the nitrogen package itself (not the cwd), so commands like
 INTERNAL_WW_DIR: str = os.path.join(os.path.dirname(__file__), "ww")
 INTERNAL_TEMP_DIR: str = os.path.join(INTERNAL_WW_DIR, "temp")
 
 running_installs: dict[tuple[str, str, str], asyncio.Task] = {}
+
+
+def _default_bin_dir() -> str:
+    user_home = os.path.expanduser("~")
+    candidates: list[str] = []
+    scripts_dir = sysconfig.get_path("scripts") if "sysconfig" in globals() else None
+    if scripts_dir:
+        candidates.append(scripts_dir)
+    if os.name == "nt":
+        candidates.extend([
+            os.path.join(sys.prefix, "Scripts"),
+            os.path.join(user_home, "AppData", "Local", "Programs", "Python", "Scripts"),
+            os.path.join(user_home, "AppData", "Roaming", "Python", "Scripts"),
+            os.path.join(user_home, "bin"),
+        ])
+    else:
+        candidates.extend([
+            os.path.join(sys.prefix, "bin"),
+            os.path.join(user_home, ".local", "bin"),
+            os.path.join(user_home, "bin"),
+            "/usr/local/bin",
+            "/usr/bin",
+        ])
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for candidate in candidates:
+        resolved = os.path.abspath(candidate)
+        if resolved not in seen:
+            seen.add(resolved)
+            ordered.append(resolved)
+    for candidate in ordered:
+        if candidate and os.access(candidate, os.W_OK):
+            return candidate
+    if os.name == "nt":
+        return os.path.join(user_home, "AppData", "Local", "Programs", "Python", "Scripts")
+    return os.path.join(user_home, ".local", "bin")
+
+
+def _load_nitropkg(path: str) -> dict:
+    pkg_dir = os.path.abspath(path)
+    if not os.path.isdir(pkg_dir):
+        raise ValueError(f"Only directories can be installed: {path}")
+    pkg_file = os.path.join(pkg_dir, ".nitropkg")
+    if not os.path.isfile(pkg_file):
+        raise ValueError(f"Only package directories with a JSON .nitropkg file can be installed: {path}")
+    try:
+        with open(pkg_file, "r", encoding="utf-8") as handle:
+            metadata = json.load(handle)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f".nitropkg is not valid JSON: {pkg_file}") from exc
+    if not isinstance(metadata, dict):
+        raise ValueError(f".nitropkg must contain a JSON object: {pkg_file}")
+    return metadata
+
+
+def _resolve_nitropkg_entry(path: str, metadata: dict) -> str:
+    entry = metadata.get("entry") or metadata.get("main") or metadata.get("script")
+    if entry:
+        target = os.path.join(path, entry)
+        if os.path.isfile(target):
+            return target
+    for candidate in ("__main__.py", "main.py", "app.py", "run.py"):
+        target = os.path.join(path, candidate)
+        if os.path.isfile(target):
+            return target
+    raise ValueError(f"No valid entry script found in package directory '{path}'")
+
+
+def _as_path_list(root: str) -> list[str]:
+    entries = [root]
+    for relative in (".ww", "ww", "libraries", os.path.join("libraries", "ww")):
+        candidate = os.path.join(root, relative)
+        if os.path.isdir(candidate):
+            entries.append(candidate)
+    return entries
+
+
+def _write_bin_script(bin_dir: str, command_name: str, target: str, root: str) -> str:
+    os.makedirs(bin_dir, exist_ok=True)
+    script_path = os.path.join(bin_dir, command_name)
+    if os.name == "nt":
+        script_path += ".cmd"
+        pythonpath = os.pathsep.join(_as_path_list(root))
+        script_content = (
+            "@echo off\r\n"
+            "setlocal\r\n"
+            "rem nitropkg-managed\r\n"
+            f"rem nitropkg-root={root}\r\n"
+            f"set \"PYTHONPATH={pythonpath};%PYTHONPATH%\"\r\n"
+            f'"{sys.executable}" "{target}" %*\r\n'
+        )
+        with open(script_path, "w", encoding="utf-8", newline="") as handle:
+            handle.write(script_content)
+        return script_path
+
+    script_content = "#!/usr/bin/env sh\n"
+    script_content += "set -eu\n"
+    script_content += "# nitropkg-managed\n"
+    script_content += f"# nitropkg-root={root}\n"
+    script_content += f"export PYTHONPATH='{os.pathsep.join(_as_path_list(root))}:$PYTHONPATH'\n"
+    script_content += f'exec "{sys.executable}" "{target}" "$@"\n'
+    with open(script_path, "w", encoding="utf-8") as handle:
+        handle.write(script_content)
+    os.chmod(script_path, os.stat(script_path).st_mode | 0o111)
+    return script_path
+
+
+def install_target(path: str, bin_dir: str | None = None, command_name: str | None = None, no_deps: bool = False) -> dict:
+    pkg_dir = os.path.abspath(path)
+    metadata = _load_nitropkg(pkg_dir)
+    resolved_name = command_name or metadata.get("name") or metadata.get("command") or os.path.basename(pkg_dir)
+    target = _resolve_nitropkg_entry(pkg_dir, metadata)
+    target_bin_dir = bin_dir or _default_bin_dir()
+    script_path = _write_bin_script(target_bin_dir, resolved_name, target, pkg_dir)
+
+    dep_file = os.path.join(pkg_dir, ".nitrodep")
+    if not no_deps and os.path.isfile(dep_file):
+        if "getdep" in globals() and callable(getdep):
+            asyncio.run(getdep(dep_file, install_root=os.path.join(pkg_dir, ".ww"), work_dir=pkg_dir, log=True, force=False))
+    return {
+        "command_name": resolved_name,
+        "source_path": pkg_dir,
+        "root": pkg_dir,
+        "target": target,
+        "bin_dir": os.path.abspath(target_bin_dir),
+        "bin_path": os.path.abspath(script_path),
+        "metadata": metadata,
+    }
+
+
+def uninstall_target(command_name: str, bin_dir: str | None = None) -> dict:
+    target_bin_dir = bin_dir or _default_bin_dir()
+    candidates = [
+        os.path.join(target_bin_dir, command_name),
+        os.path.join(target_bin_dir, command_name + ".cmd"),
+        os.path.join(target_bin_dir, command_name + ".exe"),
+    ]
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            try:
+                with open(candidate, "r", encoding="utf-8") as handle:
+                    content = handle.read(512)
+            except Exception:
+                content = ""
+            if "nitropkg-managed" not in content.lower() and "nitropkg-root" not in content.lower():
+                return {
+                    "command_name": command_name,
+                    "bin_dir": os.path.abspath(target_bin_dir),
+                    "removed": False,
+                    "path": os.path.abspath(candidate),
+                    "reason": "refusing to remove a non-nitropkg command",
+                }
+            os.remove(candidate)
+            return {
+                "command_name": command_name,
+                "bin_dir": os.path.abspath(target_bin_dir),
+                "removed": True,
+                "path": os.path.abspath(candidate),
+            }
+    return {
+        "command_name": command_name,
+        "bin_dir": os.path.abspath(target_bin_dir),
+        "removed": False,
+        "path": None,
+        "reason": "wrapper not found",
+    }
+
+
+
 
 @dataclass(slots=True)
 class InstallResult:
@@ -114,7 +282,13 @@ def _print_help() -> None:
     _print_command("rm <publication> [release]", "Delete one release or all installed releases for a publication.")
     _print_command("getdep [path]", "Install missing dependencies from a .nitrodep file, including nested ones.")
     _print_command("forcegetdep [path]", "Install all dependencies, regardless of whether they are already installed from a .nitrodep file, including nested ones, forcing reinstallation of all dependencies.")
+    _print_command("install <path> [--name <command>] [--bin <dir>] [--no-deps]", "Install a Nitrogen package from a local directory.")
+    _print_command("uninstall <command> [--bin <dir>]", "Remove an installed Nitrogen package.")
+    print()
+    _print_section("Helium")
     _print_command("updlibs <project>", "Reinstall all libraries in '<project>/libraries/ww' from their exact installed versions.")
+    print()
+    _print_section("Internal")
     _print_command("getinternal <publication> [release]", "Same as `get` into `nitrogen/ww` instead of './ww'.")
     _print_command("rminternal <publication> [release]", "Same as `rm` but for `nitrogen/ww`.")
     _print_command("getdepinternal [path]", "Same as `getdep` but for `nitrogen/ww` instead of './ww'.")
@@ -131,24 +305,6 @@ def _print_help() -> None:
     _print_command("compat rel-libs-ww <publication|directory>", "Use 'rel-libs-ww' for Helium projects or packages found in '<project>/libraries/ww' with relative imports.")
     _print_command("compat custom <publication|directory> <custom-phrase>", "Use 'custom' to specify a custom phrase for the import prefix.")
     print()
-    _print_section("Stage")
-    _print_command("stage get <publication> [release]", "Stage a dependency install into ./ww.")
-    _print_command("stage getlib <project> <publication> [release]", "Stage a library install into ./<project>/libraries/ww.")
-    _print_command("stage adddep <publication> [release]", "Stage adding one dependency line to ./.nitrodep.")
-    _print_command("stage rmdep <publication> [release]", "Stage removing one dependency line from ./.nitrodep.")
-    _print_command("stage getdep [target]", "Stage running getdep at ./<target>.")
-    _print_command("stage forcegetdep [target]", "Stage running forcegetdep at ./<target>.")
-    _print_command("stage updlibs [target]", "Stage running updlibs at ./<target>.")
-    _print_command("stage rm <publication> [release]", "Stage dependency removal from ./ww.")
-    _print_command("stage rmlib <project> <publication> [release]", "Stage library removal from ./<project>/libraries/ww.")
-    _print_command("stage compat <mode> <publication|directory> [custom-phrase]", "Stage compatibility rewrite for Wednesware imports in a directory.")
-    _print_command("stage cmd <command>", "Stage a shell command to run during stage execute/commit.")
-    _print_command("stage getinternal <publication> [release]", "Stage a dependency install into nitrogen/ww.")
-    _print_command("stage rminternal <publication> [release]", "Stage dependency removal from nitrogen/ww.")
-    _print_command("stage getdepinternal [target]", "Stage running getdep against nitrogen/ww at ./<target>.")
-    _print_command("stage cancel [subcommand|last] [args]", "Cancel one staged line, the last line, or the full stage.")
-    _print_command("stage execute", "Execute staged actions in exact order.")
-    _print_command("stage commit", "Execute staged installs/removals in batched mode.")
     print()
     _print_section("Build")
     _print_command("build zip [source path(. by default)] [output path(build.zip by default)]", "Build the current Nitrogen project into a zip archive.")
@@ -247,35 +403,6 @@ def _print_install_result(result: InstallResult, color: bool = True) -> None:
             print(f"[{label}] {line}")
 
 
-def _stage_file_path() -> str:
-    return os.path.join(".", NITROSTAGED_FILE)
-
-
-def _read_stage_lines() -> list[str]:
-    path: str = _stage_file_path()
-    if not os.path.exists(path):
-        return []
-    with open(path) as file:
-        return [line.rstrip("\n") for line in file if line.strip()]
-
-
-def _write_stage_lines(lines: list[str]) -> None:
-    path: str = _stage_file_path()
-    if not lines:
-        if os.path.exists(path):
-            os.remove(path)
-        return
-
-    with open(path, "w") as file:
-        file.write("\n".join(lines) + "\n")
-
-
-def _append_stage_line(line: str) -> None:
-    lines: list[str] = _read_stage_lines()
-    lines.append(line)
-    _write_stage_lines(lines)
-
-
 def _find_nitrodep_files(root_path: str) -> list[str]:
     if root_path.endswith(".nitrodep") and os.path.isfile(root_path):
         return [root_path]
@@ -335,25 +462,6 @@ def _remove_nitrodep_dependency(path: str, pub: str, rel: str) -> bool:
         return False
     _write_nitrodep_entries(dep_path, filtered)
     return True
-
-
-def _stage_tag_for_command(command: str) -> str | None:
-    return {
-        "get": "GET",
-        "getlib": "GETLIB",
-        "adddep": "ADDDEP",
-        "rmdep": "RMDEP",
-        "getdep": "GETDEP",
-        "forcegetdep": "FORCEGETDEP",
-        "updlibs": "UPDLIBS",
-        "compat": "COMPAT",
-        "rm": "RM",
-        "rmlib": "RMLIB",
-        "cmd": "RUNCMD",
-        "getinternal": "GETINTERNAL",
-        "rminternal": "RMINTERNAL",
-        "getdepinternal": "GETDEPINTERNAL",
-    }.get(command.lower())
 
 
 COMPAT_TAG: str = "#COMPAT"
@@ -556,51 +664,6 @@ def _parse_installed_publication_dir(dirname: str) -> tuple[str, str] | None:
     return None
 
 
-@dataclass(slots=True)
-class StageAction:
-    action: str
-    args: list[str]
-    raw: str
-
-
-def _parse_stage_line(line: str) -> StageAction | None:
-    if line.startswith("RUNCMD|"):
-        return StageAction("RUNCMD", [line[len("RUNCMD|"):]], line)
-    parts: list[str] = line.split("|")
-    if not parts:
-        return None
-    action: str = parts[0]
-    args: list[str] = parts[1:]
-    arity: dict[str, int] = {
-        "ADDDEP": 2,
-        "ADDLIB": 3,
-        "ADDNDEP": 2,
-        "RMNDEP": 2,
-        "GETDEP": 1,
-        "FORCEGETDEP": 1,
-        "UPDLIBS": 1,
-        "RMDEP": 2,
-        "RMLIB": 3,
-        "COMPAT": 3,
-        "GETINTERNAL": 2,
-        "RMINTERNAL": 2,
-        "GETDEPINTERNAL": 1,
-    }
-    if action not in arity:
-        return None
-    if len(args) != arity[action]:
-        return None
-    return StageAction(action, args, line)
-
-
-def _run_staged_command(command: str) -> None:
-    _print_status("cmd", command, "info")
-    result: subprocess.CompletedProcess = subprocess.run(command, shell=True, cwd=os.getcwd())
-    if result.returncode != 0:
-        _print_status("fail", f"Command failed with exit code {result.returncode}: {command}", "error")
-        raise SystemExit(result.returncode)
-
-
 def _queue_install_to_root(pub: str, rel: str, install_root: str, reinstall: bool = True, work_dir: str = ".", emit: bool = True) -> asyncio.Task:
     resolved_pub: str = parsepub(pub)
     key: tuple[str, str, str] = (resolved_pub.lower(), rel, os.path.realpath(install_root))
@@ -620,503 +683,6 @@ def _queue_install_to_root(pub: str, rel: str, install_root: str, reinstall: boo
 
     task.add_done_callback(cleanup)
     return task
-
-
-async def _execute_stage_ordered(actions: list[StageAction]) -> None:
-    for action in actions:
-        if action.action == "ADDDEP":
-            pub, rel = action.args
-            result: InstallResult = await _queue_install_to_root(pub, rel, "ww", True)
-            _print_install_result(result)
-            if result.exit_code:
-                raise SystemExit(result.exit_code)
-        elif action.action == "ADDLIB":
-            project, pub, rel = action.args
-            install_root: str = os.path.join(project, "libraries", "ww")
-            result = await _queue_install_to_root(pub, rel, install_root, True)
-            _print_install_result(result)
-            if result.exit_code:
-                raise SystemExit(result.exit_code)
-        elif action.action == "ADDNDEP":
-            pub, rel = action.args
-            if _add_nitrodep_dependency(".", pub, rel):
-                _print_status("done", f"Added dependency '{parsepub(pub).lower()} {rel}' to ./.nitrodep.", "success")
-            else:
-                _print_status("info", f"Dependency '{parsepub(pub).lower()} {rel}' is already in ./.nitrodep.", "muted")
-        elif action.action == "RMNDEP":
-            pub, rel = action.args
-            if _remove_nitrodep_dependency(".", pub, rel):
-                _print_status("done", f"Removed dependency '{parsepub(pub).lower()} {rel}' from ./.nitrodep.", "success")
-            else:
-                _print_status("miss", f"Dependency '{parsepub(pub).lower()} {rel}' was not found in ./.nitrodep.", "warning")
-        elif action.action == "GETDEP":
-            target = action.args[0]
-            await getdep_everywhere(target)
-        elif action.action == "FORCEGETDEP":
-            target = action.args[0]
-            await getdep_everywhere(target, force=True)
-        elif action.action == "UPDLIBS":
-            project = action.args[0]
-            await _reinstall_project_libraries(project)
-        elif action.action == "RMDEP":
-            pub, rel = action.args
-            deleted: int = _remove_publication_versions("ww", pub, rel)
-            _print_status("done", f"Removed {deleted} release{'s' if deleted != 1 else ''} of '{parsepub(pub).lower()}' ({rel}) from ./ww.", "success")
-        elif action.action == "RMLIB":
-            project, pub, rel = action.args
-            install_root = os.path.join(project, "libraries", "ww")
-            deleted = _remove_publication_versions(install_root, pub, rel)
-            _print_status("done", f"Removed {deleted} release{'s' if deleted != 1 else ''} of '{parsepub(pub).lower()}' ({rel}) from ./{project}/libraries/ww.", "success")
-        elif action.action == "RUNCMD":
-            _run_staged_command(action.args[0])
-        elif action.action == "COMPAT":
-            mode, target, custom_phrase = action.args
-            files_changed, lines_changed = _apply_compat(target, mode, custom_phrase)
-            _print_status("done", f"Compatibility rewrite completed: {files_changed} file{'s' if files_changed != 1 else ''} changed with {lines_changed} line{'s' if lines_changed != 1 else ''} modified.", "success")
-        elif action.action == "GETINTERNAL":
-            pub, rel = action.args
-            result = await _queue_install_to_root(pub, rel, INTERNAL_WW_DIR, True, INTERNAL_TEMP_DIR)
-            _print_install_result(result)
-            if result.exit_code:
-                raise SystemExit(result.exit_code)
-        elif action.action == "RMINTERNAL":
-            pub, rel = action.args
-            deleted = _remove_publication_versions(INTERNAL_WW_DIR, pub, rel)
-            _print_status("done", f"Removed {deleted} release{'s' if deleted != 1 else ''} of '{parsepub(pub).lower()}' ({rel}) from nitrogen/ww.", "success")
-        elif action.action == "GETDEPINTERNAL":
-            target = action.args[0]
-            await getdep_everywhere(target, install_root=INTERNAL_WW_DIR, work_dir=INTERNAL_TEMP_DIR)
-
-
-async def _commit_stage_batched(actions: list[StageAction]) -> None:
-    add_dep: list[tuple[str, str]] = []
-    add_lib: list[tuple[str, str, str]] = []
-    rm_dep: list[tuple[str, str]] = []
-    rm_lib: list[tuple[str, str, str]] = []
-    add_internal: list[tuple[str, str]] = []
-    rm_internal: list[tuple[str, str]] = []
-
-    for action in actions:
-        if action.action == "ADDDEP":
-            add_dep.append((action.args[0], action.args[1]))
-        elif action.action == "ADDLIB":
-            add_lib.append((action.args[0], action.args[1], action.args[2]))
-        elif action.action == "RMDEP":
-            rm_dep.append((action.args[0], action.args[1]))
-        elif action.action == "RMLIB":
-            rm_lib.append((action.args[0], action.args[1], action.args[2]))
-        elif action.action == "GETINTERNAL":
-            add_internal.append((action.args[0], action.args[1]))
-        elif action.action == "RMINTERNAL":
-            rm_internal.append((action.args[0], action.args[1]))
-
-    add_dep_pub: set[tuple[str, str]] = {(parsepub(pub).lower(), rel) for pub, rel in add_dep}
-    rm_dep_pub: set[tuple[str, str]] = {(parsepub(pub).lower(), rel) for pub, rel in rm_dep}
-    dep_conflicts: set[tuple[str, str]] = add_dep_pub & rm_dep_pub
-    if dep_conflicts:
-        text: str = ", ".join(f"{pub} {rel}" for pub, rel in sorted(dep_conflicts))
-        _print_status("fail", f"Cannot commit: adddep and rmdep conflict for {text}", "error")
-        raise SystemExit(1)
-
-    add_internal_pub: set[tuple[str, str]] = {(parsepub(pub).lower(), rel) for pub, rel in add_internal}
-    rm_internal_pub: set[tuple[str, str]] = {(parsepub(pub).lower(), rel) for pub, rel in rm_internal}
-    internal_conflicts: set[tuple[str, str]] = add_internal_pub & rm_internal_pub
-    if internal_conflicts:
-        text = ", ".join(f"{pub} {rel}" for pub, rel in sorted(internal_conflicts))
-        _print_status("fail", f"Cannot commit: getinternal and rminternal conflict for {text}", "error")
-        raise SystemExit(1)
-
-    add_lib_pub: set[tuple[str, str, str]] = {(project, parsepub(pub).lower(), rel) for project, pub, rel in add_lib}
-    rm_lib_pub: set[tuple[str, str, str]] = {(project, parsepub(pub).lower(), rel) for project, pub, rel in rm_lib}
-    lib_conflicts: set[tuple[str, str, str]] = add_lib_pub & rm_lib_pub
-    if lib_conflicts:
-        text = ", ".join(f"{project}:{pub} {rel}" for project, pub, rel in sorted(lib_conflicts))
-        _print_status("fail", f"Cannot commit: addlib and rmlib conflict in same stage for {text}", "error")
-        raise SystemExit(1)
-
-    command_failures: int = 0
-    for action in actions:
-        if action.action == "RUNCMD":
-            try:
-                _run_staged_command(action.args[0])
-            except SystemExit as err:
-                command_failures = int(err.code) if isinstance(err.code, int) else 1
-                break
-        elif action.action == "ADDNDEP":
-            pub, rel = action.args
-            if _add_nitrodep_dependency(".", pub, rel):
-                _print_status("done", f"Added dependency '{parsepub(pub).lower()} {rel}' to ./.nitrodep.", "success")
-            else:
-                _print_status("info", f"Dependency '{parsepub(pub).lower()} {rel}' is already in ./.nitrodep.", "muted")
-        elif action.action == "RMNDEP":
-            pub, rel = action.args
-            if _remove_nitrodep_dependency(".", pub, rel):
-                _print_status("done", f"Removed dependency '{parsepub(pub).lower()} {rel}' from ./.nitrodep.", "success")
-            else:
-                _print_status("miss", f"Dependency '{parsepub(pub).lower()} {rel}' was not found in ./.nitrodep.", "warning")
-        elif action.action == "GETDEP":
-            target = action.args[0]
-            await getdep_everywhere(target)
-        elif action.action == "FORCEGETDEP":
-            target = action.args[0]
-            await getdep_everywhere(target, force=True)
-        elif action.action == "UPDLIBS":
-            project = action.args[0]
-            await _reinstall_project_libraries(project)
-        elif action.action == "GETDEPINTERNAL":
-            target = action.args[0]
-            await getdep_everywhere(target, install_root=INTERNAL_WW_DIR, work_dir=INTERNAL_TEMP_DIR)
-    if command_failures:
-        raise SystemExit(command_failures)
-
-    install_tasks: list[asyncio.Task] = []
-    for pub, rel in add_dep:
-        install_tasks.append(_queue_install_to_root(pub, rel, "ww", True))
-    for project, pub, rel in add_lib:
-        install_tasks.append(_queue_install_to_root(pub, rel, os.path.join(project, "libraries", "ww"), True))
-    for pub, rel in add_internal:
-        install_tasks.append(_queue_install_to_root(pub, rel, INTERNAL_WW_DIR, True, INTERNAL_TEMP_DIR))
-
-    if install_tasks:
-        install_results: list[InstallResult] = await asyncio.gather(*install_tasks)
-        install_failures: int = 0
-        for result in install_results:
-            _print_install_result(result)
-            install_failures += int(bool(result.exit_code))
-        if install_failures:
-            _print_status("fail", f"Commit install finished with {install_failures} failure{'s' if install_failures != 1 else ''}.", "error")
-            raise SystemExit(1)
-
-    for pub, rel in rm_dep:
-        deleted: int = _remove_publication_versions("ww", pub, rel)
-        _print_status("done", f"Removed {deleted} release{'s' if deleted != 1 else ''} of '{parsepub(pub).lower()}' ({rel}) from ./ww.", "success")
-    for project, pub, rel in rm_lib:
-        install_root: str = os.path.join(project, "libraries", "ww")
-        deleted = _remove_publication_versions(install_root, pub, rel)
-        _print_status("done", f"Removed {deleted} release{'s' if deleted != 1 else ''} of '{parsepub(pub).lower()}' ({rel}) from ./{project}/libraries/ww.", "success")
-    for pub, rel in rm_internal:
-        deleted = _remove_publication_versions(INTERNAL_WW_DIR, pub, rel)
-        _print_status("done", f"Removed {deleted} release{'s' if deleted != 1 else ''} of '{parsepub(pub).lower()}' ({rel}) from nitrogen/ww.", "success")
-
-
-async def _run_staged(mode: str) -> None:
-    lines: list[str] = _read_stage_lines()
-    if not lines:
-        _print_status("info", "Nothing staged.", "muted")
-        return
-
-    actions: list[StageAction] = []
-    for line in lines:
-        parsed: StageAction | None = _parse_stage_line(line)
-        if parsed is None:
-            _print_status("fail", f"Invalid stage line: {line}", "error")
-            raise SystemExit(1)
-        actions.append(parsed)
-
-    if mode == "execute":
-        await _execute_stage_ordered(actions)
-    else:
-        await _commit_stage_batched(actions)
-
-    _write_stage_lines([])
-    _print_status("done", f"Stage completed in {mode} mode.", "success")
-
-
-async def _handle_stage_command(args: list[str]) -> None:
-    if not args:
-        _print_status("help", "Usage: n2 stage <get|getlib|adddep|rmdep|getdep|forcegetdep|updlibs|rm|rmlib|compat|cmd|getinternal|rminternal|getdepinternal|cancel|execute|commit> [...]", "warning")
-        sys.exit(1)
-
-    subcommand: str = args[0].lower()
-
-    if subcommand == "get":
-        if len(args) < 2:
-            _print_status("help", "Usage: n2 stage get <publication> [release]", "warning")
-            sys.exit(1)
-        pub: str = parsepub(args[1]).lower()
-        rel: str = args[2] if len(args) > 2 else "latest"
-        _append_stage_line(f"ADDDEP|{pub}|{rel}")
-        _print_status("stage", f"Staged get {pub} {rel}", "success")
-        return
-
-    if subcommand == "getlib":
-        if len(args) < 3:
-            _print_status("help", "Usage: n2 stage getlib <project> <publication> [release]", "warning")
-            sys.exit(1)
-        project: str = args[1]
-        pub = parsepub(args[2]).lower()
-        rel = args[3] if len(args) > 3 else "latest"
-        _append_stage_line(f"ADDLIB|{project}|{pub}|{rel}")
-        _print_status("stage", f"Staged getlib {project} {pub} {rel}", "success")
-        return
-
-    if subcommand == "adddep":
-        if len(args) < 2:
-            _print_status("help", "Usage: n2 stage adddep <publication> [release]", "warning")
-            sys.exit(1)
-        pub = parsepub(args[1]).lower()
-        rel = args[2] if len(args) > 2 else "latest"
-        _append_stage_line(f"ADDNDEP|{pub}|{rel}")
-        _print_status("stage", f"Staged adddep {pub} {rel}", "success")
-        return
-
-    if subcommand == "rmdep":
-        if len(args) < 2:
-            _print_status("help", "Usage: n2 stage rmdep <publication> [release]", "warning")
-            sys.exit(1)
-        pub = parsepub(args[1]).lower()
-        rel = args[2] if len(args) > 2 else "latest"
-        _append_stage_line(f"RMNDEP|{pub}|{rel}")
-        _print_status("stage", f"Staged rmdep {pub} {rel}", "success")
-        return
-
-    if subcommand == "getdep":
-        if len(args) > 2:
-            _print_status("help", "Usage: n2 stage getdep [target]", "warning")
-            sys.exit(1)
-        target: str = args[1] if len(args) > 1 else "."
-        _append_stage_line(f"GETDEP|{target}")
-        _print_status("stage", f"Staged getdep {target}", "success")
-        return
-
-    if subcommand == "forcegetdep":
-        if len(args) > 2:
-            _print_status("help", "Usage: n2 stage forcegetdep [target]", "warning")
-            sys.exit(1)
-        target = args[1] if len(args) > 1 else "."
-        _append_stage_line(f"FORCEGETDEP|{target}")
-        _print_status("stage", f"Staged forcegetdep {target}", "success")
-        return
-
-    if subcommand == "updlibs":
-        if len(args) > 2:
-            _print_status("help", "Usage: n2 stage updlibs [target]", "warning")
-            sys.exit(1)
-        target = args[1] if len(args) > 1 else "."
-        _append_stage_line(f"UPDLIBS|{target}")
-        _print_status("stage", f"Staged updlibs {target}", "success")
-        return
-
-    if subcommand == "rm":
-        if len(args) < 2:
-            _print_status("help", "Usage: n2 stage rm <publication> [release]", "warning")
-            sys.exit(1)
-        pub = parsepub(args[1]).lower()
-        rel = args[2] if len(args) > 2 else "latest"
-        _append_stage_line(f"RMDEP|{pub}|{rel}")
-        _print_status("stage", f"Staged rm {pub} {rel}", "success")
-        return
-
-    if subcommand == "rmlib":
-        if len(args) < 3:
-            _print_status("help", "Usage: n2 stage rmlib <project> <publication> [release]", "warning")
-            sys.exit(1)
-        project: str = args[1]
-        pub = parsepub(args[2]).lower()
-        rel = args[3] if len(args) > 3 else "latest"
-        _append_stage_line(f"RMLIB|{project}|{pub}|{rel}")
-        _print_status("stage", f"Staged rmlib {project} {pub} {rel}", "success")
-        return
-
-    if subcommand == "getinternal":
-        if len(args) < 2:
-            _print_status("help", "Usage: n2 stage getinternal <publication> [release]", "warning")
-            sys.exit(1)
-        pub = parsepub(args[1]).lower()
-        rel = args[2] if len(args) > 2 else "latest"
-        _append_stage_line(f"GETINTERNAL|{pub}|{rel}")
-        _print_status("stage", f"Staged getinternal {pub} {rel}", "success")
-        return
-
-    if subcommand == "rminternal":
-        if len(args) < 2:
-            _print_status("help", "Usage: n2 stage rminternal <publication> [release]", "warning")
-            sys.exit(1)
-        pub = parsepub(args[1]).lower()
-        rel = args[2] if len(args) > 2 else "latest"
-        _append_stage_line(f"RMINTERNAL|{pub}|{rel}")
-        _print_status("stage", f"Staged rminternal {pub} {rel}", "success")
-        return
-
-    if subcommand == "getdepinternal":
-        if len(args) > 2:
-            _print_status("help", "Usage: n2 stage getdepinternal [target]", "warning")
-            sys.exit(1)
-        target = args[1] if len(args) > 1 else "."
-        _append_stage_line(f"GETDEPINTERNAL|{target}")
-        _print_status("stage", f"Staged getdepinternal {target}", "success")
-        return
-
-    if subcommand == "compat":
-        if len(args) < 3:
-            _print_status("help", "Usage: n2 stage compat <mode> <publication|directory> [custom-phrase]", "warning")
-            sys.exit(1)
-        mode: str = args[1]
-        target: str = args[2]
-        if mode not in COMPAT_MODES and mode != "custom":
-            _print_status("help", "Usage: n2 stage compat <mode(abs|rel|rel-up1|rel-up2|rel-up3|abs-ww|rel-ww|rel-libs-ww|custom)> <publication|directory> [custom-phrase]", "warning")
-            sys.exit(1)
-        custom_phrase: str = ""
-        if mode == "custom":
-            if len(args) < 4:
-                _print_status("help", "Usage: n2 stage compat custom <publication|directory> <custom-phrase>", "warning")
-                sys.exit(1)
-            custom_phrase = args[3]
-        _append_stage_line(f"COMPAT|{mode}|{target}|{custom_phrase}")
-        _print_status("stage", f"Staged compat {mode} {target}", "success")
-        return
-
-    if subcommand == "cmd":
-        if len(args) < 2:
-            _print_status("help", "Usage: n2 stage cmd <command>", "warning")
-            sys.exit(1)
-        command: str = " ".join(args[1:])
-        _append_stage_line(f"RUNCMD|{command}")
-        _print_status("stage", f"Staged cmd: {command}", "success")
-        return
-
-    if subcommand == "cancel":
-        lines: list[str] = _read_stage_lines()
-        if not lines:
-            _print_status("info", "Nothing staged.", "muted")
-            sys.exit(0)
-
-        if len(args) == 1:
-            _write_stage_lines([])
-            _print_status("done", "Cleared entire stage.", "success")
-            sys.exit(0)
-
-        if args[1].lower() == "last":
-            removed_line: str = lines.pop()
-            _write_stage_lines(lines)
-            _print_status("done", f"Canceled last staged line: {removed_line}", "success")
-            sys.exit(0)
-
-        command_name: str = args[1].lower()
-        tag: str | None = _stage_tag_for_command(command_name)
-        if tag is None:
-            _print_status("help", "Usage: n2 stage cancel [get|getlib|adddep|rmdep|getdep|forcegetdep|updlibs|rm|rmlib|compat|cmd|getinternal|rminternal|getdepinternal|last] [args]", "warning")
-            sys.exit(1)
-
-        target_line: str | None = None
-        if tag == "GET":
-            if len(args) < 3:
-                _print_status("help", "Usage: n2 stage cancel get <publication> [release]", "warning")
-                sys.exit(1)
-            publication: str = parsepub(args[2]).lower()
-            release: str = args[3] if len(args) > 3 else "latest"
-            target_line = f"ADDDEP|{publication}|{release}"
-        elif tag == "GETLIB":
-            if len(args) < 4:
-                _print_status("help", "Usage: n2 stage cancel getlib <project> <publication> [release]", "warning")
-                sys.exit(1)
-            project = args[2]
-            publication = parsepub(args[3]).lower()
-            release = args[4] if len(args) > 4 else "latest"
-            target_line = f"ADDLIB|{project}|{publication}|{release}"
-        elif tag == "ADDDEP":
-            if len(args) < 3:
-                _print_status("help", "Usage: n2 stage cancel adddep <publication> [release]", "warning")
-                sys.exit(1)
-            publication = parsepub(args[2]).lower()
-            release = args[3] if len(args) > 3 else "latest"
-            target_line = f"ADDNDEP|{publication}|{release}"
-        elif tag == "RMDEP":
-            if len(args) < 3:
-                _print_status("help", "Usage: n2 stage cancel rmdep <publication> [release]", "warning")
-                sys.exit(1)
-            publication = parsepub(args[2]).lower()
-            release = args[3] if len(args) > 3 else "latest"
-            target_line = f"RMNDEP|{publication}|{release}"
-        elif tag == "GETDEP":
-            if len(args) > 3:
-                _print_status("help", "Usage: n2 stage cancel getdep [target]", "warning")
-                sys.exit(1)
-            target: str = args[2] if len(args) > 2 else "."
-            target_line = f"GETDEP|{target}"
-        elif tag == "FORCEGETDEP":
-            if len(args) > 3:
-                _print_status("help", "Usage: n2 stage cancel forcegetdep [target]", "warning")
-                sys.exit(1)
-            target = args[2] if len(args) > 2 else "."
-            target_line = f"FORCEGETDEP|{target}"
-        elif tag == "UPDLIBS":
-            if len(args) > 3:
-                _print_status("help", "Usage: n2 stage cancel updlibs [target]", "warning")
-                sys.exit(1)
-            target = args[2] if len(args) > 2 else "."
-            target_line = f"UPDLIBS|{target}"
-        elif tag == "RM":
-            if len(args) < 3:
-                _print_status("help", "Usage: n2 stage cancel rm <publication> [release]", "warning")
-                sys.exit(1)
-            publication = parsepub(args[2]).lower()
-            release = args[3] if len(args) > 3 else "latest"
-            target_line = f"RMDEP|{publication}|{release}"
-        elif tag == "RMLIB":
-            if len(args) < 4:
-                _print_status("help", "Usage: n2 stage cancel rmlib <project> <publication> [release]", "warning")
-                sys.exit(1)
-            project = args[2]
-            publication = parsepub(args[3]).lower()
-            release = args[4] if len(args) > 4 else "latest"
-            target_line = f"RMLIB|{project}|{publication}|{release}"
-        elif tag == "COMPAT":
-            if len(args) < 5:
-                _print_status("help", "Usage: n2 stage cancel compat <mode> <target> <custom_phrase>", "warning")
-                sys.exit(1)
-            mode = args[2]
-            target = args[3]
-            custom_phrase = args[4]
-            target_line = f"COMPAT|{mode}|{target}|{custom_phrase}"
-        elif tag == "RUNCMD":
-            if len(args) < 3:
-                _print_status("help", "Usage: n2 stage cancel cmd <command>", "warning")
-                sys.exit(1)
-            command = " ".join(args[2:])
-            target_line = f"RUNCMD|{command}"
-        elif tag == "GETINTERNAL":
-            if len(args) < 3:
-                _print_status("help", "Usage: n2 stage cancel getinternal <publication> [release]", "warning")
-                sys.exit(1)
-            publication = parsepub(args[2]).lower()
-            release = args[3] if len(args) > 3 else "latest"
-            target_line = f"GETINTERNAL|{publication}|{release}"
-        elif tag == "RMINTERNAL":
-            if len(args) < 3:
-                _print_status("help", "Usage: n2 stage cancel rminternal <publication> [release]", "warning")
-                sys.exit(1)
-            publication = parsepub(args[2]).lower()
-            release = args[3] if len(args) > 3 else "latest"
-            target_line = f"RMINTERNAL|{publication}|{release}"
-        elif tag == "GETDEPINTERNAL":
-            if len(args) > 3:
-                _print_status("help", "Usage: n2 stage cancel getdepinternal [target]", "warning")
-                sys.exit(1)
-            target = args[2] if len(args) > 2 else "."
-            target_line = f"GETDEPINTERNAL|{target}"
-
-        if target_line is None:
-            _print_status("fail", "Could not build a stage target for cancellation.", "error")
-            sys.exit(1)
-
-        try:
-            lines.remove(target_line)
-        except ValueError:
-            _print_status("miss", f"No matching staged line found: {target_line}", "warning")
-            sys.exit(1)
-
-        _write_stage_lines(lines)
-        _print_status("done", f"Canceled: {target_line}", "success")
-        return
-
-    if subcommand in {"execute", "commit"}:
-        await _run_staged(subcommand)
-        return
-
-    _print_status("help", f"Unknown stage subcommand: {subcommand}", "warning")
-    _print_status("help", "Usage: n2 stage <get|getlib|adddep|rmdep|getdep|forcegetdep|updlibs|rm|rmlib|compat|cmd|getinternal|rminternal|getdepinternal|cancel|execute|commit> [...]", "warning")
-    sys.exit(1)
 
 
 async def _reinstall_project_libraries(project: str) -> None:
@@ -1457,7 +1023,7 @@ async def build(format: str, source_path: str = ".", output_path: str = "build.%
 async def main() -> None:
     if len(sys.argv) == 1:
         print(_cli(f"Nitrogen v{VERSION}", CLI_INFO, bold=True))
-        print(_cli("Quick installer for Wednesware publications", CLI_DIM))
+        print(_cli("Fast installer for Wednesware publications.", CLI_DIM))
         print()
         print("Usage: n2 <command> [args]")
         print(f"Run {_cli('n2 help', CLI_INFO)} for a full command list.")
@@ -1468,7 +1034,15 @@ async def main() -> None:
     if not os.path.exists(TRUSTED_EXTENSIONS_FILE):
         with open(TRUSTED_EXTENSIONS_FILE, "w") as file:
             file.write("")
-    
+
+    if len(sys.argv) == 1:
+        print(_cli(f"Nitrogen v{VERSION}", CLI_INFO, bold=True))
+        print(_cli("Fast installer for Wednesware publications.", CLI_DIM))
+        print()
+        print("Usage: n2 <command> [args]")
+        print(f"Run {_cli('n2 help', CLI_INFO)} for a full command list.")
+        sys.exit(0)
+
     match sys.argv[1]:
         case "get":
             if len(sys.argv) == 2:
@@ -1518,6 +1092,48 @@ async def main() -> None:
                         _print_status("miss", f"Publication '{pub.capitalize()}' is not installed here. Are you sure you spelled it right?", "warning")
             else:
                 _print_status("miss", f"Could not find publication '{pub.capitalize()}'. Are you sure you spelled it right?", "warning")
+        case "install":
+            if len(sys.argv) == 2:
+                _print_status("help", "Usage: n2 install <path> [--name <command>] [--bin <dir>] [--no-deps]", "warning")
+                sys.exit(1)
+            args = sys.argv[2:]
+            path = args[0]
+            command_name = None
+            bin_dir = None
+            no_deps = False
+            for index in range(1, len(args)):
+                if args[index] == "--name" and index + 1 < len(args):
+                    command_name = args[index + 1]
+                elif args[index] == "--bin" and index + 1 < len(args):
+                    bin_dir = args[index + 1]
+                elif args[index] == "--no-deps":
+                    no_deps = True
+            try:
+                result = install_target(path, bin_dir=bin_dir, command_name=command_name, no_deps=no_deps)
+                _print_status("done", f"Installed command '{result['command_name']}'", "success")
+                _print_status("info", f"Target: {result['target']}", "info")
+                _print_status("info", f"Bin: {result['bin_path']}", "info")
+                _print_status("info", "You can run it directly from the shell now.", "info")
+                sys.exit(0)
+            except (FileNotFoundError, ValueError, RuntimeError) as exc:
+                _print_status("fail", str(exc), "error")
+                sys.exit(1)
+        case "uninstall":
+            if len(sys.argv) == 2:
+                _print_status("help", "Usage: n2 uninstall <command> [--bin <dir>]", "warning")
+                sys.exit(1)
+            args = sys.argv[2:]
+            command_name = args[0]
+            bin_dir = None
+            for index in range(1, len(args)):
+                if args[index] == "--bin" and index + 1 < len(args):
+                    bin_dir = args[index + 1]
+            result = uninstall_target(command_name, bin_dir=bin_dir)
+            if result["removed"]:
+                _print_status("done", f"Removed command '{command_name}' from {result['bin_dir']}", "success")
+                sys.exit(0)
+            _print_status("fail", result.get("reason", f"No Nitrogen-managed command '{command_name}' found."), "error")
+            sys.exit(1)
         case "getdep":
             path: str = sys.argv[2] if len(sys.argv) > 2 else "."
             await getdep_everywhere(path)
@@ -1577,17 +1193,17 @@ async def main() -> None:
             await getdep_everywhere(path, install_root=INTERNAL_WW_DIR, work_dir=INTERNAL_TEMP_DIR)
         case "compat":
             if len(sys.argv) < 4:
-                _print_status("help", "Usage: n2 compat <publication|directory> <mode(abs|rel|rel-up1|rel-up2|rel-up3|abs-ww|rel-ww|rel-libs-ww|custom)> [custom-phrase]", "warning")
+                _print_status("help", "Usage: n2 compat <mode(abs|rel|rel-up1|rel-up2|rel-up3|abs-ww|rel-ww|rel-libs-ww|custom)> <publication|directory> [custom-phrase]", "warning")
                 sys.exit(1)
             compat_target: str = sys.argv[3]
             compat_mode: str = sys.argv[2]
             if compat_mode not in COMPAT_MODES and compat_mode != "custom":
-                _print_status("help", "Usage: n2 compat <publication|directory> <mode(abs|rel|rel-up1|rel-up2|rel-up3|abs-ww|rel-ww|rel-libs-ww|custom)> [custom-phrase]", "warning")
+                _print_status("help", "Usage: n2 compat <mode(abs|rel|rel-up1|rel-up2|rel-up3|abs-ww|rel-ww|rel-libs-ww|custom)> <publication|directory> [custom-phrase]", "warning")
                 sys.exit(1)
             compat_custom_phrase: str = ""
             if compat_mode == "custom":
                 if len(sys.argv) < 5:
-                    _print_status("help", "Usage: n2 compat <publication|directory> custom <custom-phrase>", "warning")
+                    _print_status("help", "Usage: n2 compat custom <publication|directory> <custom-phrase>", "warning")
                     sys.exit(1)
                 compat_custom_phrase = sys.argv[4]
 
@@ -1617,8 +1233,6 @@ async def main() -> None:
                 compat_total_files += files_changed
                 compat_total_lines += lines_changed
             _print_status("done", f"Updated {compat_total_lines} line{'s' if compat_total_lines != 1 else ''} across {compat_total_files} file{'s' if compat_total_files != 1 else ''}.", "success")
-        case "stage":
-            await _handle_stage_command(sys.argv[2:])
         case "build":
             if len(sys.argv) == 2:
                 _print_status("help", "Usage: n2 build <format(zip|targz|n2x|modm)> [source path] [output path]", "warning")
