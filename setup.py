@@ -16,7 +16,7 @@ setup(
     description="Easy, ultra-lightweight installer for Wednesware publications.",
     long_description=open("README.md", "r", encoding="utf-8").read(),
     long_description_content_type="text/markdown",
-    url="https://wednesware.org/nitrogen",
+    url="https://github.com/Wednesware/Nitrogen",
     packages=find_packages(),
     install_requires=[],
     classifiers=[
