@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from urllib.request import urlretrieve
 
 
-VERSION: str = "26.51"
+VERSION: str = "26.52"
 CLI_RESET: str = "\033[0m"
 CLI_BOLD: str = "\033[1m"
 CLI_DIM: str = "\033[90m"
@@ -175,7 +175,7 @@ def _write_bin_script(bin_dir: str, command_name: str, target: str, root: str) -
     return script_path
 
 
-def install_target(path: str, bin_dir: str | None = None, command_name: str | None = None, no_deps: bool = False) -> dict:
+async def install_target(path: str, bin_dir: str | None = None, command_name: str | None = None, no_deps: bool = False) -> dict:
     pkg_dir = os.path.abspath(path)
     metadata = _load_nitropkg(pkg_dir)
     resolved_name = command_name or metadata.get("name") or metadata.get("command") or os.path.basename(pkg_dir)
@@ -186,7 +186,7 @@ def install_target(path: str, bin_dir: str | None = None, command_name: str | No
     dep_file = os.path.join(pkg_dir, ".nitrodep")
     if not no_deps and os.path.isfile(dep_file):
         if "getdep" in globals() and callable(getdep):
-            asyncio.run(getdep(dep_file, install_root=os.path.join(pkg_dir, ".ww"), work_dir=pkg_dir, log=True, force=False))
+            await getdep(dep_file, install_root=os.path.join(pkg_dir, ".ww"), work_dir=pkg_dir, log=True, force=False)
     return {
         "command_name": resolved_name,
         "source_path": pkg_dir,
