@@ -1,5 +1,7 @@
-from nitrogen import require
+from nitrogen import require, cleanup
 
-Color = require("mg.color").Color
+Color = require("magnesium.color").Color
 
 print(f"{Color.red}test{Color.reset}")
+
+cleanup()

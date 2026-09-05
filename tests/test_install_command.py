@@ -13,7 +13,7 @@ def _make_package(project_dir: str, *, entry: str = "main.py"):
         handle.write("print('hello')\n")
 
 
-def test_install_requires_nitropkg_directory():
+async def test_install_requires_nitropkg_directory():
     with tempfile.TemporaryDirectory() as tmpdir:
         project_dir = os.path.join(tmpdir, "demo-app")
         os.makedirs(project_dir)
@@ -21,13 +21,13 @@ def test_install_requires_nitropkg_directory():
             handle.write("print('no package here')\n")
 
         try:
-            nitrogen.install_target(project_dir, bin_dir=os.path.join(tmpdir, "bin"), no_deps=True)
+            await nitrogen.install_target(project_dir, bin_dir=os.path.join(tmpdir, "bin"), no_deps=True)
             assert False, "Expected ValueError for a directory without .nitropkg"
         except ValueError as exc:
             assert ".nitropkg" in str(exc)
 
 
-def test_install_creates_executable_wrapper_in_bin_dir():
+async def test_install_creates_executable_wrapper_in_bin_dir():
     with tempfile.TemporaryDirectory() as tmpdir:
         project_dir = os.path.join(tmpdir, "demo-app")
         os.makedirs(project_dir)
@@ -36,7 +36,7 @@ def test_install_creates_executable_wrapper_in_bin_dir():
         bin_dir = os.path.join(tmpdir, "bin")
         os.makedirs(bin_dir)
 
-        result = nitrogen.install_target(project_dir, bin_dir=bin_dir, no_deps=True)
+        result = await nitrogen.install_target(project_dir, bin_dir=bin_dir, no_deps=True)
 
         assert result["command_name"] == "demo-app"
         wrapper = os.path.join(bin_dir, "demo-app")
@@ -48,7 +48,7 @@ def test_install_creates_executable_wrapper_in_bin_dir():
         assert "nitropkg-managed" in content or "demo-app" in content
 
 
-def test_uninstall_removes_only_nitropkg_wrappers():
+async def test_uninstall_removes_only_nitropkg_wrappers():
     with tempfile.TemporaryDirectory() as tmpdir:
         project_dir = os.path.join(tmpdir, "demo-app")
         os.makedirs(project_dir)
@@ -57,7 +57,7 @@ def test_uninstall_removes_only_nitropkg_wrappers():
         bin_dir = os.path.join(tmpdir, "bin")
         os.makedirs(bin_dir)
 
-        installed = nitrogen.install_target(project_dir, bin_dir=bin_dir, no_deps=True)
+        installed = await nitrogen.install_target(project_dir, bin_dir=bin_dir, no_deps=True)
         uninstall_result = nitrogen.uninstall_target(installed["command_name"], bin_dir=bin_dir)
 
         assert uninstall_result["removed"] is True

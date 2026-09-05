@@ -1,9 +1,9 @@
-import sys, zipfile, shutil, os, urllib.error, subprocess, traceback, tarfile, asyncio, re, importlib, types, json, sysconfig
+import sys, zipfile, shutil, os, urllib.error, subprocess, traceback, tarfile, asyncio, re, importlib.util, json, sysconfig, platform
 from dataclasses import dataclass
 from urllib.request import urlretrieve
 
 
-VERSION: str = "26.52"
+VERSION: str = "26.53"
 CLI_RESET: str = "\033[0m"
 CLI_BOLD: str = "\033[1m"
 CLI_DIM: str = "\033[90m"
@@ -65,7 +65,7 @@ TRUSTED_EXTENSIONS_FILE: str = os.path.join(os.path.dirname(__file__), ".TRUSTED
 LEN_PATH: str = os.path.join(os.path.dirname(__file__), "ww", "len")
 # "internal" installs live inside the nitrogen package itself (not the cwd), so commands like
 INTERNAL_WW_DIR: str = os.path.join(os.path.dirname(__file__), "ww")
-INTERNAL_TEMP_DIR: str = os.path.join(INTERNAL_WW_DIR, "temp")
+INTERNAL_TEMP_DIR: str = os.path.join(os.path.dirname(__file__), "temp")
 
 running_installs: dict[tuple[str, str, str], asyncio.Task] = {}
 
@@ -271,26 +271,26 @@ def _print_command(signature: str, description: str) -> None:
 
 def _print_help() -> None:
     print(_cli(f"Nitrogen v{VERSION}", CLI_INFO, bold=True))
-    print(_cli("Quick installer for Wednesware publications", CLI_DIM))
+    print(_cli(" Fast installer for Wednesware publications.", CLI_DIM))
     print()
     _print_section("Usage")
     print("  n2 <command> [args]")
     print()
     _print_section("General")
     _print_command("get <publication> [release]", "Download a Wednesware publication from GitHub.")
-    _print_command("getlib <project> <publication> [release]", "Download a Wednesware publication into '<project>/libraries/ww'.")
     _print_command("rm <publication> [release]", "Delete one release or all installed releases for a publication.")
     _print_command("getdep [path]", "Install missing dependencies from a .nitrodep file, including nested ones.")
     _print_command("forcegetdep [path]", "Install all dependencies, regardless of whether they are already installed from a .nitrodep file, including nested ones, forcing reinstallation of all dependencies.")
     _print_command("install <path> [--name <command>] [--bin <dir>] [--no-deps]", "Install a Nitrogen package from a local directory.")
-    _print_command("uninstall <command> [--bin <dir>]", "Remove an installed Nitrogen package.")
+    _print_command("uninstall <command> [--bin <dir>]", "Uninstall a Nitrogen package by its command name.")
     print()
     _print_section("Helium")
+    _print_command("getlib <project> <publication> [release]", "Download a Wednesware publication into '<project>/libraries/ww'.")
     _print_command("updlibs <project>", "Reinstall all libraries in '<project>/libraries/ww' from their exact installed versions.")
     print()
     _print_section("Internal")
-    _print_command("getinternal <publication> [release]", "Same as `get` into `nitrogen/ww` instead of './ww'.")
-    _print_command("rminternal <publication> [release]", "Same as `rm` but for `nitrogen/ww`.")
+    _print_command("getinternal <publication> [release]", "Same as `get` but installs to `nitrogen/ww` instead of './ww'.")
+    _print_command("rminternal <publication> [release]", "Same as `rm`, but for `nitrogen/ww` instead of './ww'.")
     _print_command("getdepinternal [path]", "Same as `getdep` but for `nitrogen/ww` instead of './ww'.")
     print()
     _print_section("Compatibility")
@@ -664,7 +664,7 @@ def _parse_installed_publication_dir(dirname: str) -> tuple[str, str] | None:
     return None
 
 
-def _queue_install_to_root(pub: str, rel: str, install_root: str, reinstall: bool = True, work_dir: str = ".", emit: bool = True) -> asyncio.Task:
+def _queue_install_to_root(pub: str, rel: str, install_root: str, reinstall: bool = True, work_dir: str = ".", emit: bool = True, error: bool = False) -> asyncio.Task:
     resolved_pub: str = parsepub(pub)
     key: tuple[str, str, str] = (resolved_pub.lower(), rel, os.path.realpath(install_root))
     if key in running_installs:
@@ -674,7 +674,7 @@ def _queue_install_to_root(pub: str, rel: str, install_root: str, reinstall: boo
 
     if emit:
         _print_status("queue", f"{resolved_pub.lower()} {rel} -> {install_root}", "info")
-    task: asyncio.Task = asyncio.create_task(asyncio.to_thread(_install_publication_to_root, resolved_pub, rel, install_root, reinstall, work_dir, emit))
+    task: asyncio.Task = asyncio.create_task(asyncio.to_thread(_install_publication_to_root, resolved_pub, rel, install_root, reinstall, work_dir, emit, error))
     running_installs[key] = task
 
     def cleanup(completed_task: asyncio.Task, install_key: tuple[str, str, str] = key) -> None:
@@ -727,7 +727,7 @@ async def _reinstall_project_libraries(project: str) -> None:
 def _install_publication(pub: str, rel: str, reinstall: bool = True) -> InstallResult:
     return _install_publication_to_root(pub, rel, "ww", reinstall)
 
-def _install_publication_to_root(pub: str, rel: str, install_root: str, reinstall: bool = True, work_dir: str = ".", emit: bool = True) -> InstallResult:
+def _install_publication_to_root(pub: str, rel: str, install_root: str, reinstall: bool = True, work_dir: str = ".", emit: bool = True, error: bool = False) -> InstallResult:
     pub = parsepub(pub)
     pub_lower: str = pub.lower()
     dirname: str = os.path.join(install_root, _publication_leaf(pub, rel))
@@ -735,6 +735,7 @@ def _install_publication_to_root(pub: str, rel: str, install_root: str, reinstal
     archive_path: str = os.path.join(work_dir, f"{pub_lower}-{release_token}.zip")
     extract_dir: str = os.path.join(work_dir, f"{pub_lower}-repo-{release_token}")
     url: str = f"https://github.com/Wednesware/{pub.capitalize()}/archive/refs/heads/main.zip" if rel == "beta" else f"https://github.com/Wednesware/{pub.capitalize()}/releases/{rel + '/download' if rel == 'latest' else 'download/' + rel}/{pub_lower}.zip"
+    not_found: bool = False
     try:
         if os.path.exists(dirname) and not reinstall:
             if emit:
@@ -747,6 +748,7 @@ def _install_publication_to_root(pub: str, rel: str, install_root: str, reinstal
                 archive_path,
             )
         except urllib.error.HTTPError:
+            not_found = True
             return InstallResult(
                 "error",
                 [f"{pub_lower} {rel}: Could not find this release. Are you sure you spelled it right?"],
@@ -775,14 +777,16 @@ def _install_publication_to_root(pub: str, rel: str, install_root: str, reinstal
             shutil.rmtree(extract_dir)
         if os.path.exists(archive_path):
             os.remove(archive_path)
+        if error and not_found:
+            raise FileNotFoundError(f"Could not find release '{rel}' for publication '{pub_lower}'.")
 
 
-def _queue_install(pub: str, rel: str, reinstall: bool = True, install_root: str = "ww", work_dir: str = ".", emit: bool = True) -> asyncio.Task:
-    return _queue_install_to_root(pub, rel, install_root, reinstall, work_dir, emit)
+def _queue_install(pub: str, rel: str, reinstall: bool = True, install_root: str = "ww", work_dir: str = ".", emit: bool = True, error: bool = False) -> asyncio.Task:
+    return _queue_install_to_root(pub, rel, install_root, reinstall, work_dir, emit, error=error)
 
 
-async def install_async(pub: str, rel: str, reinstall: bool = True, color: bool = True, emit: bool = True, fatal: bool = True, install_root: str = "ww", work_dir: str = ".") -> InstallResult:
-    result: InstallResult = await _queue_install(pub, rel, reinstall, install_root, work_dir, emit)
+async def install_async(pub: str, rel: str, reinstall: bool = True, color: bool = True, emit: bool = True, fatal: bool = True, install_root: str = "ww", work_dir: str = ".", error: bool = False) -> InstallResult:
+    result: InstallResult = await _queue_install(pub, rel, reinstall, install_root, work_dir, emit, error)
     if emit:
         _print_install_result(result, color)
     if fatal and result.exit_code:
@@ -1109,7 +1113,7 @@ async def main() -> None:
                 elif args[index] == "--no-deps":
                     no_deps = True
             try:
-                result = install_target(path, bin_dir=bin_dir, command_name=command_name, no_deps=no_deps)
+                result = await install_target(path, bin_dir=bin_dir, command_name=command_name, no_deps=no_deps)
                 _print_status("done", f"Installed command '{result['command_name']}'", "success")
                 _print_status("info", f"Target: {result['target']}", "info")
                 _print_status("info", f"Bin: {result['bin_path']}", "info")
@@ -1344,13 +1348,32 @@ async def require_async(pub: str, rel: str | None = None) -> None:
     pub, submodule = [pub, None] if len(pub.split(".", 1)) == 1 else pub.split(".", 1)
     pub = PUBLICATION_CACHE.get(pub, pub)
     rel = rel or "latest"
-    result: InstallResult = await install_async(pub, rel, reinstall=False, emit=False)
+    result: InstallResult = await install_async(pub, rel, reinstall=False, install_root=INTERNAL_WW_DIR, work_dir=INTERNAL_TEMP_DIR, emit=False, error=True)
     if not result.exit_code:
         await _install_subdependencies(pub, rel, emit=False)
-    return importlib.import_module(f"ww.{REVERSE_PUBLICATION_CACHE[pub]}{rel if rel != 'latest' else ''}{'.' + submodule if submodule else ''}")
+    name: str = f"{REVERSE_PUBLICATION_CACHE[pub]}{rel.replace('.', '_') if rel != 'latest' else ''}"
+    spec: importlib.machinery.ModuleSpec = importlib.util.spec_from_file_location(
+        submodule or name,
+        os.path.join(INTERNAL_WW_DIR, name, f"{submodule.replace('.', os.sep)}.py" if submodule else "__init__.py")
+    )
+    module: object = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)  # type: ignore
+    except FileNotFoundError:
+        raise ModuleNotFoundError(f"No such submodule: '{submodule}' in publication '{pub}' release '{rel}'")
+    
+    return module
 
 def require(pub: str, rel: str | None = None) -> None:
     return asyncio.run(require_async(pub, rel))
+
+def cleanup() -> None:
+    if os.path.exists(INTERNAL_TEMP_DIR):
+        shutil.rmtree(INTERNAL_TEMP_DIR)
+        os.mkdir(INTERNAL_TEMP_DIR)
+    if os.path.exists(INTERNAL_WW_DIR):
+        shutil.rmtree(INTERNAL_WW_DIR)
+        os.mkdir(INTERNAL_WW_DIR)
             
 def entrypoint() -> None:
     asyncio.run(main())
