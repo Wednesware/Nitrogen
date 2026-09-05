@@ -70,3 +70,19 @@ async def test_uninstall_removes_only_nitropkg_wrappers():
         refusal = nitrogen.uninstall_target("rogue", bin_dir=bin_dir)
         assert refusal["removed"] is False
         assert refusal["reason"] == "refusing to remove a non-nitropkg command"
+
+
+def test_compat_custom_prefix_rewrites_ww_imports():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        project_dir = os.path.join(tmpdir, "my_project")
+        os.makedirs(project_dir)
+        file_path = os.path.join(project_dir, "demo.py")
+        with open(file_path, "w", encoding="utf-8") as handle:
+            handle.write("from ww.mg.color import Color\n")
+
+        files_changed, lines_changed = nitrogen._apply_compat(project_dir, "..ww.")
+
+        assert files_changed == 1
+        assert lines_changed == 1
+        with open(file_path, "r", encoding="utf-8") as handle:
+            assert handle.read() == "from ..ww.mg.color import Color  #COMPAT\n"

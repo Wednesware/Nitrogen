@@ -93,37 +93,29 @@ Same as `getdep`, but for `nitrogen/ww` instead of './ww'.
 
 Compatibility tools for rewriting `from ww...` imports in a directory to match a different import layout.
 
-### `compat <mode> <publication|directory> [custom-phrase]`
+### `compat <custom-phrase> <publication|directory>`
 
-Rewrite Wednesware imports in a directory to match the specified compatibility mode.
+Rewrite Wednesware imports in a directory to a custom import prefix.
 
-The following compatibility modes are available:
+The custom phrase is applied directly to the import path, with redundant `.` boundaries collapsed automatically.
 
-- `abs` — Use `abs` for packages found in `.`.
-- `rel` — Use `rel` for packages found in `<project>`.
-- `rel-up1` — Use `rel-up1` for packages found in `<project>/../`.
-- `rel-up2` — Use `rel-up2` for packages found in `<project>/../../`.
-- `rel-up3` — Use `rel-up3` for packages found in `<project>/../../../`.
-- `abs-ww` — Use `abs-ww` for packages found in `./ww`. This is the default compatibility mode.
-- `rel-ww` — Use `rel-ww` for packages found in `<project>/ww` with relative imports.
-- `rel-libs-ww` — Use `rel-libs-ww` for Helium projects or packages found in `<project>/libraries/ww` with relative imports.
-- `custom` — Use `custom` to specify a custom phrase for the import prefix.
-
-> `n2 compat custom my_project ".."`
+> `n2 compat "..ww." my_project`
+>
+> `from ww.mg.color import Color` becomes `from ..ww.mg.color import Color  #COMPAT`
 
 ## Build
 
-Build a Nitrogen project into an archive.
+Build a directory into an archive.
 
 ### `build zip [source path(. by default)] [output path(build.zip by default)]`
 
-Build the current Nitrogen project into a zip archive.
+Build a directory into a zip archive.
 
 > `n2 build zip . build.zip`
 
 ### `build targz [source path(. by default)] [output path(build.tar.gz by default)]`
 
-Build the current Nitrogen project into a tar.gz archive.
+Build a directory into a tar.gz archive.
 
 > `n2 build targz . build.tar.gz`
 
@@ -132,6 +124,12 @@ Build the current Nitrogen project into a tar.gz archive.
 Build a Nitrogen extension archive from the required extension files.
 
 > `n2 build n2x . build.n2x`
+
+### `build modm [source path(. by default)] [output path(build.modm by default)]`
+
+Build a directory into a Modmancer mod file.
+
+> `n2 build modm . build.modm`
 
 ## Documentation
 

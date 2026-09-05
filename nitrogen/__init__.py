@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from urllib.request import urlretrieve
 
 
-VERSION: str = "26.53"
+VERSION: str = "26.54"
 CLI_RESET: str = "\033[0m"
 CLI_BOLD: str = "\033[1m"
 CLI_DIM: str = "\033[90m"
@@ -11,7 +11,6 @@ CLI_INFO: str = "\033[94m"
 CLI_SUCCESS: str = "\033[92m"
 CLI_WARNING: str = "\033[93m"
 CLI_ERROR: str = "\033[91m"
-
 PUBLICATION_CACHE: dict[str, str] = {
     "n": "nitrogen",
     "mg": "magnesium",
@@ -69,7 +68,6 @@ INTERNAL_TEMP_DIR: str = os.path.join(os.path.dirname(__file__), "temp")
 
 running_installs: dict[tuple[str, str, str], asyncio.Task] = {}
 
-
 def _default_bin_dir() -> str:
     user_home = os.path.expanduser("~")
     candidates: list[str] = []
@@ -105,7 +103,6 @@ def _default_bin_dir() -> str:
         return os.path.join(user_home, "AppData", "Local", "Programs", "Python", "Scripts")
     return os.path.join(user_home, ".local", "bin")
 
-
 def _load_nitropkg(path: str) -> dict:
     pkg_dir = os.path.abspath(path)
     if not os.path.isdir(pkg_dir):
@@ -138,7 +135,7 @@ def _resolve_nitropkg_entry(path: str, metadata: dict) -> str:
 
 def _as_path_list(root: str) -> list[str]:
     entries = [root]
-    for relative in (".ww", "ww", "libraries", os.path.join("libraries", "ww")):
+    for relative in ("ww", "libraries", os.path.join("libraries", "ww")):
         candidate = os.path.join(root, relative)
         if os.path.isdir(candidate):
             entries.append(candidate)
@@ -294,22 +291,14 @@ def _print_help() -> None:
     _print_command("getdepinternal [path]", "Same as `getdep` but for `nitrogen/ww` instead of './ww'.")
     print()
     _print_section("Compatibility")
-    _print_command("compat <mode> <publication|directory> [custom-phrase]", "Rewrite Wednesware imports in a directory to match the specified compatibility mode.")
-    _print_command("compat abs <publication|directory>", "Use 'abs' for packages found in '.'. ")
-    _print_command("compat rel <publication|directory>", "Use 'rel' for packages found in '<project>'.")
-    _print_command("compat rel-up1 <publication|directory>", "Use 'rel-up1' for packages found in '<project>/../'.")
-    _print_command("compat rel-up2 <publication|directory>", "Use 'rel-up2' for packages found in '<project>/../../'.")
-    _print_command("compat rel-up3 <publication|directory>", "Use 'rel-up3' for packages found in '<project>/../../../'.")
-    _print_command("compat abs-ww <publication|directory>", "Use 'abs-ww' for packages found in './ww'. Default compat mode.")
-    _print_command("compat rel-ww <publication|directory>", "Use 'rel-ww' for packages found in '<project>/ww' with relative imports.")
-    _print_command("compat rel-libs-ww <publication|directory>", "Use 'rel-libs-ww' for Helium projects or packages found in '<project>/libraries/ww' with relative imports.")
-    _print_command("compat custom <publication|directory> <custom-phrase>", "Use 'custom' to specify a custom phrase for the import prefix.")
-    print()
+    _print_command("compat <custom-phrase> <publication|directory>", "Rewrite Wednesware imports in a directory to a custom import prefix.")
+    _print_command("compat \"..ww.\" my_project", "Use a custom relative prefix like '..ww.' for packages under the project root.")
     print()
     _print_section("Build")
-    _print_command("build zip [source path(. by default)] [output path(build.zip by default)]", "Build the current Nitrogen project into a zip archive.")
-    _print_command("build targz [source path(. by default)] [output path(build.tar.gz by default)]", "Build the current Nitrogen project into a tar.gz archive.")
+    _print_command("build zip [source path(. by default)] [output path(build.zip by default)]", "Build a directory into a zip archive.")
+    _print_command("build targz [source path(. by default)] [output path(build.tar.gz by default)]", "Build a directory into a tar.gz archive.")
     _print_command("build n2x [source path(. by default)] [output path(build.n2x by default)]", "Build a Nitrogen extension archive from the required extension files.")
+    _print_command("build modm [source path(. by default)] [output path(build.modm by default)]", "Build a directory into a Modmancer mod file.")
     print()
     _print_section("Documentation")
     _print_command("readme [extension]", "Show the README for Nitrogen or an installed extension.")
@@ -465,81 +454,37 @@ def _remove_nitrodep_dependency(path: str, pub: str, rel: str) -> bool:
 
 
 COMPAT_TAG: str = "#COMPAT"
-# Each compat mode is pure data: a prefix plus a join strategy, so adding a new mode never
-# requires touching the transform logic below - just add an entry here.
-#   "dot"      -> collapse the boundary between a trailing "." on the prefix and the sub-path's
-#                 leading "." into a single "." (namespace-style prefixes, e.g. "ww.", ".ww.")
-#   "raw"      -> concatenate prefix and sub-path verbatim, no collapsing (every "." is
-#                 meaningful, e.g. "up N levels" relative prefixes)
-#   "strip"    -> drop the sub-path's own leading "." entirely (plain absolute imports)
-#   "identity" -> the sub-path is already in canonical form; only the empty-path fallback is used
-COMPAT_MODES: dict[str, tuple[str, str]] = {
-    "abs-ww": ("ww.", "dot"),
-    "abs": ("", "strip"),
-    "rel": (".", "identity"),
-    "rel-up1": ("..", "raw"),
-    "rel-up2": ("...", "raw"),
-    "rel-up3": ("....", "raw"),
-    "rel-ww": (".ww.", "dot"),
-    "rel-libs-ww": (".libraries.ww.", "dot"),
-}
 _COMPAT_LINE_RE = re.compile(r'^(\s*)from\s+(?:\.?(?:libraries\.)?)ww(\.[^\s]*|)(\s+import\s+.*)$')
 _COMPAT_TAGGED_LINE_RE = re.compile(r'^(\s*)from\s+(\S+)(\s+import\s+.*)$')
 
-def _compat_join(prefix: str, rest: str, join: str) -> str | None:
-    if join == "identity":
-        return rest if rest else prefix
-    if join == "strip":
-        sub: str = rest[1:] if rest.startswith(".") else rest
-        return sub or None
-    if join == "raw":
-        return prefix + rest
-    # join == "dot": collapse a trailing "." on the prefix with the sub-path's leading "."
+
+def _compat_join(prefix: str, rest: str) -> str | None:
+    if not prefix:
+        return rest or None
     if not rest:
         return prefix[:-1] if prefix.endswith(".") else prefix
     if prefix.endswith(".") and rest.startswith("."):
         return prefix[:-1] + rest
     return prefix + rest
 
-def _compat_new_path(mode: str, custom_phrase: str, rest: str) -> str | None:
-    if mode == "custom":
-        return _compat_join(custom_phrase, rest, "raw")
-    config: tuple[str, str] | None = COMPAT_MODES.get(mode)
-    if config is None:
+
+def _compat_new_path(custom_phrase: str, rest: str) -> str | None:
+    if not custom_phrase:
         return None
-    prefix, join = config
-    return _compat_join(prefix, rest, join)
+    return _compat_join(custom_phrase, rest)
+
 
 def _compat_rest_from_tagged_path(path: str, custom_phrase: str) -> str:
-    # recover the canonical (dot-prefixed) sub-path from a path already rewritten by any mode,
-    # so switching modes on a previously-tagged line works even without knowing which mode built it
-    def _is_canonical(candidate: str) -> bool:
-        return candidate == "" or candidate.startswith(".")
-
-    raw_prefixes: list[str] = sorted(
-        (prefix for prefix, join in COMPAT_MODES.values() if join == "raw"), key=len, reverse=True
-    )
-    if custom_phrase:
-        raw_prefixes.insert(0, custom_phrase)
-    for prefix in raw_prefixes:
-        if path.startswith(prefix) and _is_canonical(path[len(prefix):]):
-            return path[len(prefix):]
-
-    dot_prefixes: list[str] = sorted(
-        (prefix for prefix, join in COMPAT_MODES.values() if join == "dot"), key=len, reverse=True
-    )
-    for prefix in dot_prefixes:
-        base: str = prefix[:-1] if prefix.endswith(".") else prefix
-        if path == base:
-            return ""
-        if path.startswith(base + "."):
-            return path[len(base):]
-
+    if custom_phrase and path.startswith(custom_phrase):
+        suffix: str = path[len(custom_phrase):]
+        if suffix == "" or suffix.startswith("."):
+            return suffix
     if path in ("", "."):
         return ""
     return path if path.startswith(".") else "." + path
 
-def _compat_transform_line(line: str, mode: str, custom_phrase: str) -> str | None:
+
+def _compat_transform_line(line: str, custom_phrase: str) -> str | None:
     ending: str = "\n" if line.endswith("\n") else ""
     body: str = line[:-1] if ending else line
     stripped: str = body.strip()
@@ -563,13 +508,14 @@ def _compat_transform_line(line: str, mode: str, custom_phrase: str) -> str | No
             return None
         leading_ws, rest, import_clause = match.group(1), match.group(2), match.group(3)
 
-    new_path: str | None = _compat_new_path(mode, custom_phrase, rest)
+    new_path: str | None = _compat_new_path(custom_phrase, rest)
     if new_path is None:
         return None
     new_body: str = f"{leading_ws}from {new_path}{import_clause}  {COMPAT_TAG}"
     if new_body == body:
         return None
     return new_body + ending
+
 
 def _iter_python_files(root: str):
     if os.path.isfile(root):
@@ -581,7 +527,8 @@ def _iter_python_files(root: str):
             if filename.endswith(".py"):
                 yield os.path.join(dirpath, filename)
 
-def _apply_compat(directory: str, mode: str, custom_phrase: str) -> tuple[int, int]:
+
+def _apply_compat(directory: str, custom_phrase: str) -> tuple[int, int]:
     files_changed: int = 0
     lines_changed: int = 0
     for path in _iter_python_files(directory):
@@ -589,7 +536,7 @@ def _apply_compat(directory: str, mode: str, custom_phrase: str) -> tuple[int, i
             lines: list[str] = file.readlines()
         changed: bool = False
         for i, line in enumerate(lines):
-            new_line: str | None = _compat_transform_line(line, mode, custom_phrase)
+            new_line: str | None = _compat_transform_line(line, custom_phrase)
             if new_line is not None:
                 lines[i] = new_line
                 changed = True
@@ -1196,20 +1143,11 @@ async def main() -> None:
             path = sys.argv[2] if len(sys.argv) > 2 else "."
             await getdep_everywhere(path, install_root=INTERNAL_WW_DIR, work_dir=INTERNAL_TEMP_DIR)
         case "compat":
-            if len(sys.argv) < 4:
-                _print_status("help", "Usage: n2 compat <mode(abs|rel|rel-up1|rel-up2|rel-up3|abs-ww|rel-ww|rel-libs-ww|custom)> <publication|directory> [custom-phrase]", "warning")
+            if len(sys.argv) != 4:
+                _print_status("help", "Usage: n2 compat <custom-phrase> <publication|directory>", "warning")
                 sys.exit(1)
+            compat_phrase: str = sys.argv[2]
             compat_target: str = sys.argv[3]
-            compat_mode: str = sys.argv[2]
-            if compat_mode not in COMPAT_MODES and compat_mode != "custom":
-                _print_status("help", "Usage: n2 compat <mode(abs|rel|rel-up1|rel-up2|rel-up3|abs-ww|rel-ww|rel-libs-ww|custom)> <publication|directory> [custom-phrase]", "warning")
-                sys.exit(1)
-            compat_custom_phrase: str = ""
-            if compat_mode == "custom":
-                if len(sys.argv) < 5:
-                    _print_status("help", "Usage: n2 compat custom <publication|directory> <custom-phrase>", "warning")
-                    sys.exit(1)
-                compat_custom_phrase = sys.argv[4]
 
             compat_dirs: list[str]
             if "/" in compat_target:
@@ -1233,7 +1171,7 @@ async def main() -> None:
             compat_total_files: int = 0
             compat_total_lines: int = 0
             for compat_dir in compat_dirs:
-                files_changed, lines_changed = _apply_compat(compat_dir, compat_mode, compat_custom_phrase)
+                files_changed, lines_changed = _apply_compat(compat_dir, compat_phrase)
                 compat_total_files += files_changed
                 compat_total_lines += lines_changed
             _print_status("done", f"Updated {compat_total_lines} line{'s' if compat_total_lines != 1 else ''} across {compat_total_files} file{'s' if compat_total_files != 1 else ''}.", "success")
