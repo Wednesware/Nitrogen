@@ -1,9 +1,15 @@
-import sys, zipfile, shutil, os, urllib.error, subprocess, traceback, tarfile, asyncio, re, importlib.util, json, sysconfig, platform
+import sys, zipfile, shutil, os, urllib.error, subprocess, traceback, asyncio, re, importlib.util, json, sysconfig, platform
 from dataclasses import dataclass
 from urllib.request import urlretrieve
 
 
-VERSION: str = "26.54"
+VERSION: str = "26.55"
+
+
+class NitrogenDependencyError(RuntimeError):
+    """Raised when a publication cannot be loaded from the local cache and cannot be downloaded."""
+
+
 CLI_RESET: str = "\033[0m"
 CLI_BOLD: str = "\033[1m"
 CLI_DIM: str = "\033[90m"
@@ -56,12 +62,11 @@ PUBLICATION_CACHE: dict[str, str] = {
     "tc": "technetium",
     "ru": "ruthenium",
     "rh": "rhodium",
-    "pd": "palladium"
+    "pd": "palladium",
+    "ra": "radium",
+    "rn": "radon"
 }
 REVERSE_PUBLICATION_CACHE: dict[str, str] = {v: k for k, v in PUBLICATION_CACHE.items()}
-EXTENSIONS_DIR: str = os.path.join(os.path.dirname(__file__), "extensions")
-TRUSTED_EXTENSIONS_FILE: str = os.path.join(os.path.dirname(__file__), ".TRUSTED_EXTENSIONS")
-LEN_PATH: str = os.path.join(os.path.dirname(__file__), "ww", "len")
 # "internal" installs live inside the nitrogen package itself (not the cwd), so commands like
 INTERNAL_WW_DIR: str = os.path.join(os.path.dirname(__file__), "ww")
 INTERNAL_TEMP_DIR: str = os.path.join(os.path.dirname(__file__), "temp")
@@ -76,15 +81,14 @@ def _default_bin_dir() -> str:
         candidates.append(scripts_dir)
     if os.name == "nt":
         candidates.extend([
-            os.path.join(sys.prefix, "Scripts"),
+            os.path.join(user_home, "bin"),
             os.path.join(user_home, "AppData", "Local", "Programs", "Python", "Scripts"),
             os.path.join(user_home, "AppData", "Roaming", "Python", "Scripts"),
-            os.path.join(user_home, "bin"),
         ])
     else:
         candidates.extend([
-            os.path.join(sys.prefix, "bin"),
             os.path.join(user_home, ".local", "bin"),
+            os.path.join(sys.prefix, "bin"),
             os.path.join(user_home, "bin"),
             "/usr/local/bin",
             "/usr/bin",
@@ -195,6 +199,38 @@ async def install_target(path: str, bin_dir: str | None = None, command_name: st
     }
 
 
+def install_cached_publication(pub: str, rel: str = "latest", *, bin_dir: str | None = None, command_name: str | None = None, cache_root: str | None = None) -> dict:
+    resolved_pub = parsepub(pub)
+    target_root = cache_root or INTERNAL_WW_DIR
+    publication_dir = os.path.join(target_root, _publication_leaf(resolved_pub, rel))
+    if not os.path.isdir(publication_dir):
+        raise FileNotFoundError(f"Publication '{resolved_pub}' release '{rel}' is not installed in the internal cache at '{publication_dir}'.")
+
+    candidates = [
+        os.path.join(publication_dir, "__main__.py"),
+        os.path.join(publication_dir, "main.py"),
+        os.path.join(publication_dir, "app.py"),
+        os.path.join(publication_dir, "run.py"),
+    ]
+    target = next((candidate for candidate in candidates if os.path.isfile(candidate)), None)
+    if target is None:
+        raise ValueError(f"No executable entry point was found for cached publication '{resolved_pub}' release '{rel}' in '{publication_dir}'.")
+
+    resolved_name = command_name or resolved_pub.lower()
+    target_bin_dir = bin_dir or _default_bin_dir()
+    script_path = _write_bin_script(target_bin_dir, resolved_name, target, publication_dir)
+    return {
+        "command_name": resolved_name,
+        "publication": resolved_pub,
+        "release": rel,
+        "source_path": publication_dir,
+        "root": publication_dir,
+        "target": target,
+        "bin_dir": os.path.abspath(target_bin_dir),
+        "bin_path": os.path.abspath(script_path),
+    }
+
+
 def uninstall_target(command_name: str, bin_dir: str | None = None) -> dict:
     target_bin_dir = bin_dir or _default_bin_dir()
     candidates = [
@@ -276,74 +312,14 @@ def _print_help() -> None:
     _print_section("General")
     _print_command("get <publication> [release]", "Download a Wednesware publication from GitHub.")
     _print_command("rm <publication> [release]", "Delete one release or all installed releases for a publication.")
-    _print_command("getdep [path]", "Install missing dependencies from a .nitrodep file, including nested ones.")
-    _print_command("forcegetdep [path]", "Install all dependencies, regardless of whether they are already installed from a .nitrodep file, including nested ones, forcing reinstallation of all dependencies.")
     _print_command("install <path> [--name <command>] [--bin <dir>] [--no-deps]", "Install a Nitrogen package from a local directory.")
+    _print_command("install-cache <publication> [release] [--name <command>] [--bin <dir>]", "Install a cached publication from the Nitrogen internal cache as a command.")
     _print_command("uninstall <command> [--bin <dir>]", "Uninstall a Nitrogen package by its command name.")
     print()
-    _print_section("Helium")
-    _print_command("getlib <project> <publication> [release]", "Download a Wednesware publication into '<project>/libraries/ww'.")
-    _print_command("updlibs <project>", "Reinstall all libraries in '<project>/libraries/ww' from their exact installed versions.")
-    print()
-    _print_section("Internal")
-    _print_command("getinternal <publication> [release]", "Same as `get` but installs to `nitrogen/ww` instead of './ww'.")
-    _print_command("rminternal <publication> [release]", "Same as `rm`, but for `nitrogen/ww` instead of './ww'.")
-    _print_command("getdepinternal [path]", "Same as `getdep` but for `nitrogen/ww` instead of './ww'.")
-    print()
-    _print_section("Compatibility")
-    _print_command("compat <custom-phrase> <publication|directory>", "Rewrite Wednesware imports in a directory to a custom import prefix.")
-    _print_command("compat \"..ww.\" my_project", "Use a custom relative prefix like '..ww.' for packages under the project root.")
-    print()
-    _print_section("Build")
-    _print_command("build zip [source path(. by default)] [output path(build.zip by default)]", "Build a directory into a zip archive.")
-    _print_command("build targz [source path(. by default)] [output path(build.tar.gz by default)]", "Build a directory into a tar.gz archive.")
-    _print_command("build n2x [source path(. by default)] [output path(build.n2x by default)]", "Build a Nitrogen extension archive from the required extension files.")
-    _print_command("build modm [source path(. by default)] [output path(build.modm by default)]", "Build a directory into a Modmancer mod file.")
-    print()
     _print_section("Documentation")
-    _print_command("readme [extension]", "Show the README for Nitrogen or an installed extension.")
-    _print_command("license [extension]", "Show the license for Nitrogen or an installed extension.")
+    _print_command("readme", "Show the Nitrogen README.")
+    _print_command("license", "Show the Nitrogen license.")
     _print_command("help", "Show this help message.")
-    print()
-    _print_section("Extensions")
-    _print_command("list-ext", "List installed extensions and their local paths.")
-    _print_command("trust-ext <extension>", "Trust an extension so it can run without confirmation.")
-    _print_command("untrust-ext <extension>", "Remove trust for an extension.")
-    _print_command("install-ext <extension>", "Install an extension from LEN.")
-    _print_command("uninstall-ext <extension>", "Remove an installed extension.")
-    _print_command("list-len", "List available extensions in LEN.")
-    _print_command("load-len", "Clone the LEN repository locally.")
-    _print_command("unload-len", "Remove the local LEN checkout.")
-
-
-def _print_installed_extensions() -> None:
-    _print_section("Installed extensions")
-    sent: bool = False
-    for ext_filename in [item for item in os.listdir(EXTENSIONS_DIR) if item.endswith(".n2x")]:
-        print(f"  {_cli(ext_filename, CLI_INFO)} {_cli('->', CLI_DIM)} {os.path.join(EXTENSIONS_DIR, ext_filename)}")
-        sent = True
-    if not sent:
-        _print_status("empty", "No extensions were detected.", "warning")
-
-
-def _print_len_extensions() -> None:
-    _print_section("Available extensions")
-    printed: bool = False
-    for ext_filename in [item for item in os.listdir(LEN_PATH) if item.endswith(".n2x")]:
-        print(f"  {_cli(ext_filename, CLI_INFO)} {_cli('->', CLI_DIM)} https://github.com/Wednesware/LEN/blob/main/{ext_filename}")
-        printed = True
-    if not printed:
-        _print_status("empty", "No extensions were detected in the LEN repository.", "warning")
-
-
-def _print_extension_commands() -> None:
-    _print_section("Custom commands")
-    printed: bool = False
-    for ext_path in [item for item in os.listdir(EXTENSIONS_DIR) if item.endswith(".n2x")]:
-        print(f"  {_cli(ext_path.removesuffix('.n2x'), CLI_INFO)} {_cli('-', CLI_DIM)} Provided by '{ext_path}' at '{os.path.join(EXTENSIONS_DIR, ext_path)}'")
-        printed = True
-    if not printed:
-        print(f"  {_cli('(none installed)', CLI_DIM)}")
 
 def parsepub(pub: str) -> str:
     if pub.lower() in PUBLICATION_CACHE:
@@ -451,101 +427,6 @@ def _remove_nitrodep_dependency(path: str, pub: str, rel: str) -> bool:
         return False
     _write_nitrodep_entries(dep_path, filtered)
     return True
-
-
-COMPAT_TAG: str = "#COMPAT"
-_COMPAT_LINE_RE = re.compile(r'^(\s*)from\s+(?:\.?(?:libraries\.)?)ww(\.[^\s]*|)(\s+import\s+.*)$')
-_COMPAT_TAGGED_LINE_RE = re.compile(r'^(\s*)from\s+(\S+)(\s+import\s+.*)$')
-
-
-def _compat_join(prefix: str, rest: str) -> str | None:
-    if not prefix:
-        return rest or None
-    if not rest:
-        return prefix[:-1] if prefix.endswith(".") else prefix
-    if prefix.endswith(".") and rest.startswith("."):
-        return prefix[:-1] + rest
-    return prefix + rest
-
-
-def _compat_new_path(custom_phrase: str, rest: str) -> str | None:
-    if not custom_phrase:
-        return None
-    return _compat_join(custom_phrase, rest)
-
-
-def _compat_rest_from_tagged_path(path: str, custom_phrase: str) -> str:
-    if custom_phrase and path.startswith(custom_phrase):
-        suffix: str = path[len(custom_phrase):]
-        if suffix == "" or suffix.startswith("."):
-            return suffix
-    if path in ("", "."):
-        return ""
-    return path if path.startswith(".") else "." + path
-
-
-def _compat_transform_line(line: str, custom_phrase: str) -> str | None:
-    ending: str = "\n" if line.endswith("\n") else ""
-    body: str = line[:-1] if ending else line
-    stripped: str = body.strip()
-    is_tagged: bool = stripped.endswith(COMPAT_TAG)
-    if not (stripped.startswith("from ww") or is_tagged):
-        return None
-    working: str = body
-    if working.rstrip().endswith(COMPAT_TAG):
-        tag_index: int = working.rstrip().rfind(COMPAT_TAG)
-        working = working[:tag_index].rstrip()
-
-    if is_tagged:
-        tagged_match: re.Match | None = _COMPAT_TAGGED_LINE_RE.match(working)
-        if tagged_match is None:
-            return None
-        leading_ws, path, import_clause = tagged_match.group(1), tagged_match.group(2), tagged_match.group(3)
-        rest: str = _compat_rest_from_tagged_path(path, custom_phrase)
-    else:
-        match: re.Match | None = _COMPAT_LINE_RE.match(working)
-        if match is None:
-            return None
-        leading_ws, rest, import_clause = match.group(1), match.group(2), match.group(3)
-
-    new_path: str | None = _compat_new_path(custom_phrase, rest)
-    if new_path is None:
-        return None
-    new_body: str = f"{leading_ws}from {new_path}{import_clause}  {COMPAT_TAG}"
-    if new_body == body:
-        return None
-    return new_body + ending
-
-
-def _iter_python_files(root: str):
-    if os.path.isfile(root):
-        if root.endswith(".py"):
-            yield root
-        return
-    for dirpath, _dirnames, filenames in os.walk(root):
-        for filename in filenames:
-            if filename.endswith(".py"):
-                yield os.path.join(dirpath, filename)
-
-
-def _apply_compat(directory: str, custom_phrase: str) -> tuple[int, int]:
-    files_changed: int = 0
-    lines_changed: int = 0
-    for path in _iter_python_files(directory):
-        with open(path) as file:
-            lines: list[str] = file.readlines()
-        changed: bool = False
-        for i, line in enumerate(lines):
-            new_line: str | None = _compat_transform_line(line, custom_phrase)
-            if new_line is not None:
-                lines[i] = new_line
-                changed = True
-                lines_changed += 1
-        if changed:
-            with open(path, "w") as file:
-                file.writelines(lines)
-            files_changed += 1
-    return files_changed, lines_changed
 
 
 def _remove_publication_versions(install_root: str, pub: str, rel: str | None = None) -> int:
@@ -842,135 +723,6 @@ async def _install_subdependencies(pub: str, rel: str, color: bool = True, insta
     if emit:
         _print_status("done", f"Sub-dependencies for {resolved_pub.lower()} {rel} are ready.", "success")
         
-def trust(ext_filename: str, ext_dir_path: str) -> None:
-    ext_path: str = os.path.join(EXTENSIONS_DIR, ext_filename)
-    if not os.path.exists(ext_path):
-        print(f"\033[91mExtension '{ext_filename}' not found and cannot be trusted.")
-        return
-    with open(TRUSTED_EXTENSIONS_FILE) as file:
-        content: str = file.read()
-    if ext_filename not in content:
-        try:
-            if input(f"\033[38;5;208m/!\\ WARNING: You are running this extension for the first time.\n    Make sure to review the contents of\n      \033[0;1;3m{ext_dir_path}\033[0;38;5;208m\n    before running.\n    Trust extension and run command? (y/N) \033[0m").strip().lower() in ["y", "yes", "yeah", "true", "t"]:
-                with open(TRUSTED_EXTENSIONS_FILE, "a") as file:
-                    file.write(f"{ext_filename}\n")
-            else:
-                raise KeyboardInterrupt
-        except (KeyboardInterrupt, EOFError):
-            print("\n\033[91m    Extension not trusted. Aborting.\033[0m")
-            sys.exit(0)
-            
-def load_len() -> None:
-    try:
-        if os.path.exists(LEN_PATH):
-            unload_len()
-        _print_status("sync", "Loading LEN from GitHub...", "info")
-        proc = subprocess.Popen(
-            [
-                "git",
-                "clone",
-                "--progress",
-                "https://github.com/Wednesware/LEN.git",
-                LEN_PATH,
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True
-        )
-
-        for line in proc.stdout:
-            print(_cli(f"  {line.rstrip()}", CLI_DIM))
-        if proc.returncode != 0 and proc.returncode is not None:
-            raise subprocess.CalledProcessError(proc.returncode, proc.args)
-        proc.wait()
-        _print_status("done", "LEN loaded successfully.", "success")
-    except subprocess.CalledProcessError:
-        _print_status("fail", "Could not load LEN from GitHub. Are you sure you have an internet connection?", "error")
-        sys.exit(1)
-        
-def unload_len() -> None:
-    if os.path.exists(LEN_PATH):
-        shutil.rmtree(LEN_PATH)
-        _print_status("done", "LEN unloaded.", "success")
-    else:
-        _print_status("info", "LEN is not loaded.", "muted")
-
-async def build(format: str, source_path: str = ".", output_path: str = "build.%") -> None:
-    _print_status("build", "Preparing build...", "info")
-    try:
-        output_path = output_path.replace("%", {
-            "zip": "zip",
-            "targz": "tar.gz",
-            "n2x": "n2x",
-            "modm": "modm"
-        }[format])
-    except KeyError:
-        _print_status("fail", f"Unknown build format '{format}'.", "error")
-        return
-    if not os.path.isdir(source_path):
-        _print_status("fail", f"Source path '{source_path}' does not exist or is not a directory.", "error")
-        return
-    source_abs: str = os.path.abspath(source_path)
-    output_abs: str = os.path.abspath(output_path)
-    output_dir: str = os.path.dirname(output_abs)
-    if output_dir and not os.path.exists(output_dir):
-        os.makedirs(output_dir, exist_ok=True)
-
-    def should_skip(path: str) -> bool:
-        return os.path.abspath(path) == output_abs
-
-    match format:
-        case "zip":
-            _print_status("build", f"Building project into {output_path}...", "info")
-            with zipfile.ZipFile(output_abs, "w", zipfile.ZIP_DEFLATED) as zipf:
-                for root, dirs, files in os.walk(source_abs):
-                    for file in files:
-                        file_path = os.path.join(root, file)
-                        if should_skip(file_path):
-                            continue
-                        arcname = os.path.relpath(file_path, source_abs)
-                        _print_status("pack", f"Packing {arcname}", "info")
-                        zipf.write(file_path, arcname)
-            _print_status("done", f"Build complete in {output_path}", "success")
-        case "targz":
-            _print_status("build", f"Building project into {output_path}...", "info")
-            with tarfile.open(output_abs, "w:gz") as tar:
-                for root, dirs, files in os.walk(source_abs):
-                    for file in files:
-                        file_path = os.path.join(root, file)
-                        if should_skip(file_path):
-                            continue
-                        arcname = os.path.relpath(file_path, source_abs)
-                        _print_status("pack", f"Packing {arcname}", "info")
-                        tar.add(file_path, arcname=arcname)
-            _print_status("done", f"Build complete in {output_path}", "success")
-        case "n2x":
-            _print_status("build", f"Building project into {output_path}...", "info")
-            required_files = ["ext.py", "README.md", "LICENSE.md", ".nitrodep"]
-            with tarfile.open(output_abs, "w:gz") as tar:
-                for file in required_files:
-                    file_path = os.path.join(source_abs, file)
-                    _print_status("pack", f"Packing {file}", "info")
-                    if not os.path.isfile(file_path):
-                        _print_status("fail", f"Required file for build not found: '{file}'", "error")
-                        return
-                    tar.add(file_path, arcname=file)
-            _print_status("done", f"Build complete in {output_path}", "success")
-        case "modm":
-            _print_status("build", f"Building project into {output_path}...", "info")
-            with tarfile.open(output_abs, "w:gz") as tar:
-                for root, dirs, files in os.walk(source_abs):
-                    for file in files:
-                        file_path = os.path.join(root, file)
-                        if should_skip(file_path):
-                            continue
-                        arcname = os.path.relpath(file_path, source_abs)
-                        _print_status("pack", f"Packing {arcname}", "info")
-                        tar.add(file_path, arcname=arcname)
-            _print_status("done", f"Build complete in {output_path}", "success")
-        case _:
-            _print_status("fail", f"Unknown build format '{format}'.", "error")
-
 async def main() -> None:
     if len(sys.argv) == 1:
         print(_cli(f"Nitrogen v{VERSION}", CLI_INFO, bold=True))
@@ -979,12 +731,6 @@ async def main() -> None:
         print("Usage: n2 <command> [args]")
         print(f"Run {_cli('n2 help', CLI_INFO)} for a full command list.")
         sys.exit(0)
-
-    if not os.path.exists(EXTENSIONS_DIR):
-        os.makedirs(EXTENSIONS_DIR)
-    if not os.path.exists(TRUSTED_EXTENSIONS_FILE):
-        with open(TRUSTED_EXTENSIONS_FILE, "w") as file:
-            file.write("")
 
     if len(sys.argv) == 1:
         print(_cli(f"Nitrogen v{VERSION}", CLI_INFO, bold=True))
@@ -999,44 +745,39 @@ async def main() -> None:
             if len(sys.argv) == 2:
                 _print_status("help", "Usage: n2 get <publication> [release]", "warning")
                 sys.exit(1)
-            pub: str = sys.argv[2]
-            rel: str = sys.argv[3] if len(sys.argv) > 3 else "latest"
-            result: InstallResult = await install_async(pub, rel)
+            pub = sys.argv[2]
+            rel = sys.argv[3] if len(sys.argv) > 3 else "latest"
+            result = await install_async(pub, rel, install_root=INTERNAL_WW_DIR, work_dir=INTERNAL_TEMP_DIR)
             if not result.exit_code:
-                await _install_subdependencies(pub, rel)
-        case "getlib":
-            if len(sys.argv) < 4:
-                _print_status("help", "Usage: n2 getlib <project> <publication> [release]", "warning")
-                sys.exit(1)
-            project: str = sys.argv[2]
-            pub = sys.argv[3]
-            rel = sys.argv[4] if len(sys.argv) > 4 else "latest"
-            install_root: str = os.path.join(project, "libraries", "ww")
-            result = await _queue_install_to_root(pub, rel, install_root, True)
-            _print_install_result(result)
-            if result.exit_code:
-                raise SystemExit(result.exit_code)
+                await _install_subdependencies(pub, rel, install_root=INTERNAL_WW_DIR, work_dir=INTERNAL_TEMP_DIR)
         case "rm":
             if len(sys.argv) == 2:
                 _print_status("help", "Usage: n2 rm <publication> [release]", "warning")
                 sys.exit(1)
-            pub: str = parsepub(sys.argv[2])
+            pub = parsepub(sys.argv[2])
             _print_status("rm", f"Deleting {pub}", "info")
             if pub.strip() == "all":
-                if os.path.exists("ww"):
-                    shutil.rmtree("ww")
+                if os.path.isdir(INTERNAL_WW_DIR):
+                    for entry in os.listdir(INTERNAL_WW_DIR):
+                        if entry in ("len", "temp"):
+                            continue
+                        entry_path: str = os.path.join(INTERNAL_WW_DIR, entry)
+                        if os.path.isdir(entry_path):
+                            shutil.rmtree(entry_path)
+                        else:
+                            os.remove(entry_path)
                 else:
                     _print_status("info", "No publications installed.", "muted")
             elif pub in PUBLICATION_CACHE or pub in REVERSE_PUBLICATION_CACHE:
                 if len(sys.argv) > 3:
-                    rel: str = sys.argv[3]
-                    deleted: int = _remove_publication_versions("ww", pub, rel)
+                    rel = sys.argv[3]
+                    deleted = _remove_publication_versions(INTERNAL_WW_DIR, pub, rel)
                     if deleted:
                         _print_status("done", "Operation complete.", "success")
                     else:
                         _print_status("miss", f"Release '{rel}' of publication '{pub.capitalize()}' is not installed here. Are you sure you spelled it right?", "warning")
                 else:
-                    deleted: int = _remove_publication_versions("ww", pub)
+                    deleted = _remove_publication_versions(INTERNAL_WW_DIR, pub)
                     if deleted:
                         _print_status("done", "Operation complete.", "success")
                     else:
@@ -1069,6 +810,30 @@ async def main() -> None:
             except (FileNotFoundError, ValueError, RuntimeError) as exc:
                 _print_status("fail", str(exc), "error")
                 sys.exit(1)
+        case "install-cache":
+            if len(sys.argv) == 2:
+                _print_status("help", "Usage: n2 install-cache <publication> [release] [--name <command>] [--bin <dir>]", "warning")
+                sys.exit(1)
+            args = sys.argv[2:]
+            pub = args[0]
+            rel = args[1] if len(args) > 1 and not args[1].startswith("--") else "latest"
+            command_name = None
+            bin_dir = None
+            for index in range(1 if len(args) > 1 and args[1].startswith("--") else 2, len(args)):
+                if args[index] == "--name" and index + 1 < len(args):
+                    command_name = args[index + 1]
+                elif args[index] == "--bin" and index + 1 < len(args):
+                    bin_dir = args[index + 1]
+            try:
+                result = install_cached_publication(pub, rel, bin_dir=bin_dir, command_name=command_name)
+                _print_status("done", f"Installed cached command '{result['command_name']}'", "success")
+                _print_status("info", f"Target: {result['target']}", "info")
+                _print_status("info", f"Bin: {result['bin_path']}", "info")
+                _print_status("info", "You can run it directly from the shell now.", "info")
+                sys.exit(0)
+            except (FileNotFoundError, ValueError, RuntimeError) as exc:
+                _print_status("fail", str(exc), "error")
+                sys.exit(1)
         case "uninstall":
             if len(sys.argv) == 2:
                 _print_status("help", "Usage: n2 uninstall <command> [--bin <dir>]", "warning")
@@ -1085,224 +850,64 @@ async def main() -> None:
                 sys.exit(0)
             _print_status("fail", result.get("reason", f"No Nitrogen-managed command '{command_name}' found."), "error")
             sys.exit(1)
-        case "getdep":
-            path: str = sys.argv[2] if len(sys.argv) > 2 else "."
-            await getdep_everywhere(path)
-        case "forcegetdep":
-            path: str = sys.argv[2] if len(sys.argv) > 2 else "."
-            await getdep_everywhere(path, force=True)
-        case "updlibs":
-            if len(sys.argv) < 3:
-                _print_status("help", "Usage: n2 updlibs <project>", "warning")
-                sys.exit(1)
-            await _reinstall_project_libraries(sys.argv[2])
-        case "getinternal":
-            if len(sys.argv) == 2:
-                _print_status("help", "Usage: n2 getinternal <publication> [release]", "warning")
-                sys.exit(1)
-            pub = sys.argv[2]
-            rel = sys.argv[3] if len(sys.argv) > 3 else "latest"
-            result = await install_async(pub, rel, install_root=INTERNAL_WW_DIR, work_dir=INTERNAL_TEMP_DIR)
-            if not result.exit_code:
-                await _install_subdependencies(pub, rel, install_root=INTERNAL_WW_DIR, work_dir=INTERNAL_TEMP_DIR)
-        case "rminternal":
-            if len(sys.argv) == 2:
-                _print_status("help", "Usage: n2 rminternal <publication> [release]", "warning")
-                sys.exit(1)
-            pub = parsepub(sys.argv[2])
-            _print_status("rm", f"Deleting {pub}", "info")
-            if pub.strip() == "all":
-                if os.path.isdir(INTERNAL_WW_DIR):
-                    for entry in os.listdir(INTERNAL_WW_DIR):
-                        if entry in ("len", "temp"):
-                            continue
-                        entry_path: str = os.path.join(INTERNAL_WW_DIR, entry)
-                        if os.path.isdir(entry_path):
-                            shutil.rmtree(entry_path)
-                        else:
-                            os.remove(entry_path)
-                else:
-                    _print_status("info", "No publications installed.", "muted")
-            elif pub in PUBLICATION_CACHE or pub in REVERSE_PUBLICATION_CACHE:
-                if len(sys.argv) > 3:
-                    rel = sys.argv[3]
-                    deleted = _remove_publication_versions(INTERNAL_WW_DIR, pub, rel)
-                    if deleted:
-                        _print_status("done", "Operation complete.", "success")
-                    else:
-                        _print_status("miss", f"Release '{rel}' of publication '{pub.capitalize()}' is not installed here. Are you sure you spelled it right?", "warning")
-                else:
-                    deleted = _remove_publication_versions(INTERNAL_WW_DIR, pub)
-                    if deleted:
-                        _print_status("done", "Operation complete.", "success")
-                    else:
-                        _print_status("miss", f"Publication '{pub.capitalize()}' is not installed here. Are you sure you spelled it right?", "warning")
-            else:
-                _print_status("miss", f"Could not find publication '{pub.capitalize()}'. Are you sure you spelled it right?", "warning")
-        case "getdepinternal":
-            path = sys.argv[2] if len(sys.argv) > 2 else "."
-            await getdep_everywhere(path, install_root=INTERNAL_WW_DIR, work_dir=INTERNAL_TEMP_DIR)
-        case "compat":
-            if len(sys.argv) != 4:
-                _print_status("help", "Usage: n2 compat <custom-phrase> <publication|directory>", "warning")
-                sys.exit(1)
-            compat_phrase: str = sys.argv[2]
-            compat_target: str = sys.argv[3]
-
-            compat_dirs: list[str]
-            if "/" in compat_target:
-                compat_dirs = [compat_target]
-            else:
-                compat_pub: str = parsepub(compat_target).lower()
-                compat_symbol: str = REVERSE_PUBLICATION_CACHE.get(compat_pub, compat_pub)
-                compat_prefixes: set[str] = {compat_pub, compat_symbol}
-                compat_dirs = []
-                if os.path.isdir("ww"):
-                    compat_dirs = [
-                        os.path.join("ww", name) for name in os.listdir("ww")
-                        if os.path.isdir(os.path.join("ww", name)) and any(name.lower().startswith(prefix) for prefix in compat_prefixes)
-                    ]
-
-            compat_dirs = [directory for directory in compat_dirs if os.path.exists(directory)]
-            if not compat_dirs:
-                _print_status("miss", f"Could not find any installed directories for '{compat_target}'.", "warning")
-                sys.exit(1)
-
-            compat_total_files: int = 0
-            compat_total_lines: int = 0
-            for compat_dir in compat_dirs:
-                files_changed, lines_changed = _apply_compat(compat_dir, compat_phrase)
-                compat_total_files += files_changed
-                compat_total_lines += lines_changed
-            _print_status("done", f"Updated {compat_total_lines} line{'s' if compat_total_lines != 1 else ''} across {compat_total_files} file{'s' if compat_total_files != 1 else ''}.", "success")
-        case "build":
-            if len(sys.argv) == 2:
-                _print_status("help", "Usage: n2 build <format(zip|targz|n2x|modm)> [source path] [output path]", "warning")
-                sys.exit(1)
-            await build(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else ".", sys.argv[4] if len(sys.argv) > 4 else "build.%")
         case "readme":
-            if len(sys.argv) == 2:
-                with open(os.path.join(os.path.dirname(__file__), "README.md")) as file:
-                    print(file.read())
-                sys.exit(0)
-            ext_path: str = sys.argv[2] + ".n2x"
-            with zipfile.ZipFile(os.path.join(EXTENSIONS_DIR, ext_path), "r") as zip_ref:
-                zip_ref.extractall(ext_path.replace('.', '-'))
-            with open(os.path.join(ext_path.replace('.', '-'), "README.md")) as file:
+            with open(os.path.join(os.path.dirname(__file__), "README.md")) as file:
                 print(file.read())
+            sys.exit(0)
         case "license":
-            if len(sys.argv) == 2:
-                with open(os.path.join(os.path.dirname(__file__), "LICENSE.md")) as file:
-                    print(file.read())
-                sys.exit(0)
-            ext_path: str = sys.argv[2] + ".n2x"
-            with zipfile.ZipFile(os.path.join(EXTENSIONS_DIR, ext_path), "r") as zip_ref:
-                zip_ref.extractall(ext_path.replace('.', '-'))
-            with open(os.path.join(ext_path.replace('.', '-'), "LICENSE.md")) as file:
+            with open(os.path.join(os.path.dirname(__file__), "LICENSE.md")) as file:
                 print(file.read())
-        case "trust-ext":
-            if len(sys.argv) == 2:
-                _print_status("help", "Usage: n2 trust-ext <extension>", "warning")
-                sys.exit(1)
-            ext_filename: str = sys.argv[2] + ".n2x"
-            ext_path: str = os.path.join(EXTENSIONS_DIR, ext_filename)
-            ext_dir_path: str = ext_path.replace('.', '-')
-            trust(ext_filename, ext_dir_path)
-        case "untrust-ext":
-            if len(sys.argv) == 2:
-                _print_status("help", "Usage: n2 untrust-ext <extension>", "warning")
-                sys.exit(1)
-            ext_filename: str = sys.argv[2] + ".n2x"
-            with open(TRUSTED_EXTENSIONS_FILE) as file:
-                content: str = file.read()
-            with open(TRUSTED_EXTENSIONS_FILE, "w") as file:
-                file.write("\n".join([line for line in content.split("\n") if line.strip() != ext_filename]))
-        case "list-ext":
-            _print_installed_extensions()
-        case "load-len":
-            load_len()
-        case "unload-len":
-            unload_len()
-        case "install-ext":
-            if len(sys.argv) == 2:
-                _print_status("help", "Usage: n2 install-ext <extension>", "warning")
-                sys.exit(1)
-            load_len()
-            install_ext_filename: str = sys.argv[2] if sys.argv[2].endswith(".n2x") else sys.argv[2] + ".n2x"
-            if os.path.exists(os.path.join(LEN_PATH, install_ext_filename)):
-                shutil.copy(os.path.join(LEN_PATH, install_ext_filename), EXTENSIONS_DIR)
-                _print_status("done", f"Extension '{sys.argv[2]}' installed successfully.", "success")
-            else:
-                _print_status("miss", f"Extension '{sys.argv[2]}' not found in the LEN repository.", "warning")
-        case "uninstall-ext":
-            if len(sys.argv) == 2:
-                _print_status("help", "Usage: n2 uninstall-ext <extension>", "warning")
-                sys.exit(1)
-            ext_filename: str = sys.argv[2] + ".n2x" if not sys.argv[2].endswith(".n2x") else sys.argv[2]
-            ext_path: str = os.path.join(EXTENSIONS_DIR, ext_filename)
-            if os.path.exists(ext_path):
-                os.remove(ext_path)
-                _print_status("done", f"Extension '{sys.argv[2]}' uninstalled successfully.", "success")
-            else:
-                _print_status("miss", f"Extension '{sys.argv[2]}' not installed.", "warning")
-        case "list-len":
-            load_len()
-            _print_len_extensions()
+            sys.exit(0)
         case "help":
             _print_help()
-            print()
-            _print_extension_commands()
         case _:
-            for ext_filename2 in [item for item in os.listdir(EXTENSIONS_DIR) if item.endswith(".n2x") or item.endswith(".n2xp")]:
-                ext_path2: str = os.path.join(EXTENSIONS_DIR, ext_filename2)
-                for ext_filename in [item for item in os.listdir(ext_path2) if item.endswith(".n2x")] if ext_filename2.endswith(".n2xp") else [ext_filename2]:
-                    try:
-                        if sys.argv[1] == ext_filename.removesuffix(".n2x"):
-                            ext_path: str = os.path.join(EXTENSIONS_DIR, ext_filename)
-                            ext_dir_path: str = ext_path.replace('.', '-')
-                            with tarfile.open(ext_path, "r:gz") as tar:
-                                tar.extractall(ext_dir_path)
-                            trust(ext_filename, ext_dir_path)
-                            script_path: str = os.path.join(ext_dir_path, "ext.py")
-                            nitrodep_path: str = os.path.join(ext_dir_path, ".nitrodep")
-                            if os.path.exists(nitrodep_path):
-                                print("\033[94m", end="", flush=True)
-                                await getdep(nitrodep_path, log=False)
-                                print("\033[0m", end="", flush=True)
-                            subprocess.run(["python", script_path, *sys.argv[2:]])
-                            if os.path.exists(ext_dir_path):
-                                shutil.rmtree(ext_dir_path)
-                            if os.path.exists("ww"):
-                                shutil.rmtree("ww")
-                            return
-                    except Exception:
-                        for line in traceback.format_exc().split("\n"):
-                            if line.strip():
-                                print(_cli(f"  {line}", CLI_ERROR))
             _print_status("miss", f"Unknown command: {sys.argv[1]}", "warning")
             print(f"Run {_cli('n2 help', CLI_INFO)} for a list of commands.")
             
-async def require_async(pub: str, rel: str | None = None) -> None:
-    pub, submodule = [pub, None] if len(pub.split(".", 1)) == 1 else pub.split(".", 1)
-    pub = PUBLICATION_CACHE.get(pub, pub)
+async def require_async(pub: str, rel: str | None = None) -> object:
+    pub_name, submodule = [pub, None] if len(pub.split(".", 1)) == 1 else pub.split(".", 1)
+    pub = parsepub(pub_name)
     rel = rel or "latest"
-    result: InstallResult = await install_async(pub, rel, reinstall=False, install_root=INTERNAL_WW_DIR, work_dir=INTERNAL_TEMP_DIR, emit=False, error=True)
-    if not result.exit_code:
+    cache_dir = os.path.join(INTERNAL_WW_DIR, _publication_leaf(pub, rel))
+
+    if not os.path.isdir(cache_dir):
+        try:
+            result: InstallResult = await install_async(pub, rel, reinstall=False, install_root=INTERNAL_WW_DIR, work_dir=INTERNAL_TEMP_DIR, emit=False, error=True)
+        except (urllib.error.URLError, urllib.error.HTTPError, OSError, TimeoutError, ConnectionError) as exc:
+            raise NitrogenDependencyError(
+                f"Could not install '{pub}' release '{rel}' because the site is unreachable or offline. "
+                "Install it once online or make sure the package is already cached locally."
+            ) from exc
+        if result.exit_code:
+            lines = " ".join(result.lines)
+            raise NitrogenDependencyError(
+                f"Could not install '{pub}' release '{rel}' because the dependency is unavailable or the site is unreachable: {lines}"
+            )
         await _install_subdependencies(pub, rel, emit=False)
-    name: str = f"{REVERSE_PUBLICATION_CACHE[pub]}{rel.replace('.', '_') if rel != 'latest' else ''}"
+
+    name: str = _publication_leaf(pub, rel)
+    module_path = os.path.join(cache_dir, f"{submodule.replace('.', os.sep)}.py" if submodule else "__init__.py")
+    if not os.path.exists(module_path):
+        if submodule is None:
+            raise ModuleNotFoundError(f"No package entry point found in publication '{pub}' release '{rel}'")
+        raise ModuleNotFoundError(f"No such submodule: '{submodule}' in publication '{pub}' release '{rel}'")
+
     spec: importlib.machinery.ModuleSpec = importlib.util.spec_from_file_location(
         submodule or name,
-        os.path.join(INTERNAL_WW_DIR, name, f"{submodule.replace('.', os.sep)}.py" if submodule else "__init__.py")
+        module_path,
     )
+    if spec is None or spec.loader is None:
+        raise ModuleNotFoundError(f"Could not load publication '{pub}' release '{rel}'")
+
     module: object = importlib.util.module_from_spec(spec)
     try:
-        spec.loader.exec_module(module)  # type: ignore
-    except FileNotFoundError:
-        raise ModuleNotFoundError(f"No such submodule: '{submodule}' in publication '{pub}' release '{rel}'")
-    
+        spec.loader.exec_module(module)  # type: ignore[arg-type]
+    except FileNotFoundError as exc:
+        raise ModuleNotFoundError(f"No such submodule: '{submodule}' in publication '{pub}' release '{rel}'") from exc
     return module
 
-def require(pub: str, rel: str | None = None) -> None:
+
+def require(pub: str, rel: str | None = None) -> object:
     return asyncio.run(require_async(pub, rel))
 
 def cleanup() -> None:

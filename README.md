@@ -33,23 +33,17 @@ Delete one release or all installed releases for a publication. If no release is
 
 > `n2 rm magnesium 26.5`
 
-### `getdep [path]`
-
-Install missing dependencies from a `.nitrodep` file, including nested ones. If no path is specified, the current working directory will be used.
-
-> `n2 getdep my_project`
-
-### `forcegetdep [path]`
-
-Install all dependencies, regardless of whether they are already installed from a `.nitrodep` file, including nested ones, forcing reinstallation of all dependencies. If no path is specified, the current working directory will be used.
-
-> `n2 forcegetdep my_project`
-
 ### `install <path> [--name <command>] [--bin <dir>] [--no-deps]`
 
 Install a Nitrogen package from a local directory.
 
-> `n2 install my_project --name my_command --bin ./bin --no-deps`
+> `n2 install ./my_package --name my_command --bin ./bin --no-deps`
+
+### `install-cache <publication> [release] [--name <command>] [--bin <dir>]`
+
+Install a cached publication from Nitrogen's internal cache as a command without re-downloading.
+
+> `n2 install-cache magnesium 26.5 --name mg --bin ./bin`
 
 ### `uninstall <command> [--bin <dir>]`
 
@@ -57,153 +51,27 @@ Uninstall a Nitrogen package by its command name. If the `--bin` option is not s
 
 > `n2 uninstall my_command --bin ./bin`
 
-## Helium
-
-Helium support within Nitrogen.
-
-### `getlib <project> <publication> [release]`
-
-Download a Wednesware publication into `<project>/libraries/ww`. Used to download libraries for Helium projects.
-
-> `n2 getlib my_project magnesium 26.5`
-
-### `updlibs <project>`
-
-Reinstall all libraries in `<project>/libraries/ww` from their exact installed versions. Used to update libraries for Helium projects.
-
-> `n2 updlibs my_project`
-
-## Internal
-
-Internal tools for caching and storing publications.
-
-### `getinternal <publication> [release]`
-
-Same as `get`, but installs to `nitrogen/ww` instead of './ww'.
-
-### `rminternal <publication> [release]`
-
-Same as `rm`, but for `nitrogen/ww` instead of './ww'.
-
-### `getdepinternal [path]`
-
-Same as `getdep`, but for `nitrogen/ww` instead of './ww'.
-
-## Compatibility
-
-Compatibility tools for rewriting `from ww...` imports in a directory to match a different import layout.
-
-### `compat <custom-phrase> <publication|directory>`
-
-Rewrite Wednesware imports in a directory to a custom import prefix.
-
-The custom phrase is applied directly to the import path, with redundant `.` boundaries collapsed automatically.
-
-> `n2 compat "..ww." my_project`
->
-> `from ww.mg.color import Color` becomes `from ..ww.mg.color import Color  #COMPAT`
-
-## Build
-
-Build a directory into an archive.
-
-### `build zip [source path(. by default)] [output path(build.zip by default)]`
-
-Build a directory into a zip archive.
-
-> `n2 build zip . build.zip`
-
-### `build targz [source path(. by default)] [output path(build.tar.gz by default)]`
-
-Build a directory into a tar.gz archive.
-
-> `n2 build targz . build.tar.gz`
-
-### `build n2x [source path(. by default)] [output path(build.n2x by default)]`
-
-Build a Nitrogen extension archive from the required extension files.
-
-> `n2 build n2x . build.n2x`
-
-### `build modm [source path(. by default)] [output path(build.modm by default)]`
-
-Build a directory into a Modmancer mod file.
-
-> `n2 build modm . build.modm`
-
 ## Documentation
 
-Read documentation bundled with Nitrogen or an installed extension.
+Read documentation bundled with Nitrogen.
 
-### `readme [extension]`
+### `readme`
 
-Show the README for an installed extension, or Nitrogen itself if no argument is provided.
+Show the Nitrogen README.
 
-> `n2 readme my_extension`
+> `n2 readme`
 
-### `license [extension]`
+### `license`
 
-Show the license for an installed extension, or Nitrogen itself if no argument is provided.
+Show the Nitrogen license.
 
-> `n2 license my_extension`
+> `n2 license`
 
 ### `help`
 
-Show the full help message with all installed commands.
+Show the full help message with all commands.
 
 > `n2 help`
-
-## Extensions
-
-Install, trust, and manage Nitrogen extensions.
-
-### `list-ext`
-
-List installed extensions and their local paths.
-
-> `n2 list-ext`
-
-### `trust-ext <extension>`
-
-Trust an extension so it can run without confirmation.
-
-> `n2 trust-ext my_extension`
-
-### `untrust-ext <extension>`
-
-Remove trust for an extension.
-
-> `n2 untrust-ext my_extension`
-
-### `install-ext <extension>`
-
-Install an extension from LEN.
-
-> `n2 install-ext my_extension`
-
-### `uninstall-ext <extension>`
-
-Remove an installed extension.
-
-> `n2 uninstall-ext my_extension`
-
-### `list-len`
-
-List available extensions in LEN.
-
-> `n2 list-len`
-
-### `load-len`
-
-Clone the LEN repository locally.
-
-> `n2 load-len`
-
-### `unload-len`
-
-Remove the local LEN checkout.
-
-> `n2 unload-len`
 
 # Definitions
 
@@ -211,11 +79,15 @@ Remove the local LEN checkout.
 
 Nitrogen can be used as a Python library. You may use any internal functions, but there are also functions specifically meant for use via the library.
 
-### `nitrogen:require(pub: str, rel: str | None = None) -> None`
+### `nitrogen:require(pub: str, rel: str | None = None) -> object`
 
-Get a Wednesware publication. Installs to the internal cache directory and persists across sessions. Only downloads the publication if it is not already installed. If a release is specified, that release will be downloaded. If no release is specified, the latest release will be downloaded. Submodules should be provided within the `pub` parameter like `magnesium.color`. Chemical symbols can also be used for publication names, e.g. `mg` for Magnesium, `he` for Helium.
+Load a Wednesware publication from Nitrogen's internal cache. The first run may need internet access to download the publication, but later runs reuse the cached copy locally. Submodules should be provided within the `pub` parameter like `magnesium.color`. Chemical symbols can also be used for publication names, e.g. `mg` for Magnesium, `he` for Helium.
 
 > `Color = require("magnesium.color", "26.5").Color`
+
+### `nitrogen:NitrogenDependencyError`
+
+Raised when a dependency is not already cached locally and the source site cannot be reached or is otherwise unavailable.
 
 ### `nitrogen:cleanup() -> None`
 
