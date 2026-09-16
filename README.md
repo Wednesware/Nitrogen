@@ -9,7 +9,7 @@
 
 ## Installation
 
-> `pipx install wwn`
+> `pip install wwn`
 
 ## Dependencies
 

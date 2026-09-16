@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from urllib.request import urlretrieve
 
 
-VERSION: str = "26.55"
+VERSION: str = "26.56"
 
 
 class NitrogenDependencyError(RuntimeError):
@@ -76,9 +76,6 @@ running_installs: dict[tuple[str, str, str], asyncio.Task] = {}
 def _default_bin_dir() -> str:
     user_home = os.path.expanduser("~")
     candidates: list[str] = []
-    scripts_dir = sysconfig.get_path("scripts") if "sysconfig" in globals() else None
-    if scripts_dir:
-        candidates.append(scripts_dir)
     if os.name == "nt":
         candidates.extend([
             os.path.join(user_home, "bin"),
@@ -138,17 +135,40 @@ def _resolve_nitropkg_entry(path: str, metadata: dict) -> str:
 
 
 def _as_path_list(root: str) -> list[str]:
-    entries = [root]
+    root_abs = os.path.abspath(root)
+    parent_abs = os.path.dirname(root_abs)
+    entries: list[str] = []
+    for candidate in (parent_abs, root_abs):
+        if candidate and candidate not in entries:
+            entries.append(candidate)
     for relative in ("ww", "libraries", os.path.join("libraries", "ww")):
-        candidate = os.path.join(root, relative)
-        if os.path.isdir(candidate):
+        candidate = os.path.join(root_abs, relative)
+        if os.path.isdir(candidate) and candidate not in entries:
+            entries.append(candidate)
+    for relative in ("ww", "libraries", os.path.join("libraries", "ww")):
+        candidate = os.path.join(parent_abs, relative)
+        if os.path.isdir(candidate) and candidate not in entries:
             entries.append(candidate)
     return entries
 
 
-def _write_bin_script(bin_dir: str, command_name: str, target: str, root: str) -> str:
+def _module_name_from_root(root: str) -> str | None:
+    package_init = os.path.join(root, "__init__.py")
+    if os.path.isfile(package_init):
+        package_name = os.path.basename(root)
+        normalized = package_name.replace("-", "_").replace(".", "_")
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", normalized):
+            return normalized
+    return None
+
+
+def _write_bin_script(bin_dir: str, command_name: str, target: str, root: str, module_name: str | None = None) -> str:
     os.makedirs(bin_dir, exist_ok=True)
     script_path = os.path.join(bin_dir, command_name)
+    run_target = target
+    if module_name:
+        run_target = f"-m {module_name}"
+
     if os.name == "nt":
         script_path += ".cmd"
         pythonpath = os.pathsep.join(_as_path_list(root))
@@ -158,7 +178,7 @@ def _write_bin_script(bin_dir: str, command_name: str, target: str, root: str) -
             "rem nitropkg-managed\r\n"
             f"rem nitropkg-root={root}\r\n"
             f"set \"PYTHONPATH={pythonpath};%PYTHONPATH%\"\r\n"
-            f'"{sys.executable}" "{target}" %*\r\n'
+            f'"{sys.executable}" {run_target} %*\r\n'
         )
         with open(script_path, "w", encoding="utf-8", newline="") as handle:
             handle.write(script_content)
@@ -169,7 +189,7 @@ def _write_bin_script(bin_dir: str, command_name: str, target: str, root: str) -
     script_content += "# nitropkg-managed\n"
     script_content += f"# nitropkg-root={root}\n"
     script_content += f"export PYTHONPATH='{os.pathsep.join(_as_path_list(root))}:$PYTHONPATH'\n"
-    script_content += f'exec "{sys.executable}" "{target}" "$@"\n'
+    script_content += f'exec "{sys.executable}" {run_target} "$@"\n'
     with open(script_path, "w", encoding="utf-8") as handle:
         handle.write(script_content)
     os.chmod(script_path, os.stat(script_path).st_mode | 0o111)
@@ -182,7 +202,8 @@ async def install_target(path: str, bin_dir: str | None = None, command_name: st
     resolved_name = command_name or metadata.get("name") or metadata.get("command") or os.path.basename(pkg_dir)
     target = _resolve_nitropkg_entry(pkg_dir, metadata)
     target_bin_dir = bin_dir or _default_bin_dir()
-    script_path = _write_bin_script(target_bin_dir, resolved_name, target, pkg_dir)
+    module_name = _module_name_from_root(pkg_dir)
+    script_path = _write_bin_script(target_bin_dir, resolved_name, target, pkg_dir, module_name=module_name)
 
     dep_file = os.path.join(pkg_dir, ".nitrodep")
     if not no_deps and os.path.isfile(dep_file):

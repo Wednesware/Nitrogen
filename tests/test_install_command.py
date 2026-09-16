@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import subprocess
 import tempfile
 import urllib.error
 
@@ -56,6 +57,31 @@ def test_install_creates_executable_wrapper_in_bin_dir():
             assert "nitropkg-managed" in content or "demo-app" in content
 
         asyncio.run(run())
+
+
+def test_install_uses_module_execution_for_package_entrypoints(tmp_path):
+    project_dir = tmp_path / "myproject"
+    project_dir.mkdir()
+    (project_dir / ".nitropkg").write_text(json.dumps({"name": "myproject", "entry": "__main__.py"}), encoding="utf-8")
+    (project_dir / "__init__.py").write_text("x = 20\n", encoding="utf-8")
+    (project_dir / "__main__.py").write_text("from . import x\nprint(x)\n", encoding="utf-8")
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+
+    async def run():
+        result = await nitrogen.install_target(str(project_dir), bin_dir=str(bin_dir), no_deps=True)
+        assert result["command_name"] == "myproject"
+
+        wrapper = bin_dir / "myproject"
+        assert wrapper.exists()
+        content = wrapper.read_text(encoding="utf-8")
+        assert "-m myproject" in content
+
+        completed = subprocess.run([str(wrapper)], capture_output=True, text=True, check=True)
+        assert "20" in completed.stdout
+
+    asyncio.run(run())
 
 
 def test_uninstall_removes_only_nitropkg_wrappers():
