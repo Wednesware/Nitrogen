@@ -133,6 +133,30 @@ def test_require_uses_cached_internal_install_without_redownloading(monkeypatch,
     assert module.VALUE == 42
 
 
+def test_require_works_when_called_from_a_running_event_loop(monkeypatch, tmp_path):
+    cache_dir = tmp_path / "cache"
+    temp_dir = tmp_path / "temp"
+    cache_dir.mkdir()
+    temp_dir.mkdir()
+    package_dir = cache_dir / "mg26_5"
+    package_dir.mkdir()
+    (package_dir / "__init__.py").write_text("VALUE = 99\n", encoding="utf-8")
+
+    monkeypatch.setattr(nitrogen, "INTERNAL_WW_DIR", str(cache_dir))
+    monkeypatch.setattr(nitrogen, "INTERNAL_TEMP_DIR", str(temp_dir))
+
+    async def fail_install(*args, **kwargs):
+        raise AssertionError("require should not redownload while a cached install already exists")
+
+    monkeypatch.setattr(nitrogen, "install_async", fail_install)
+
+    async def run():
+        module = nitrogen.require("mg", "26.5")
+        assert module.VALUE == 99
+
+    asyncio.run(run())
+
+
 def test_require_raises_custom_error_when_site_is_unreachable(monkeypatch):
     async def fail_install(*args, **kwargs):
         raise urllib.error.URLError("offline")

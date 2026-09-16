@@ -1,9 +1,9 @@
-import sys, zipfile, shutil, os, urllib.error, subprocess, traceback, asyncio, re, importlib.util, json, sysconfig, platform
+import sys, zipfile, shutil, os, urllib.error, subprocess, traceback, asyncio, re, importlib.util, json, sysconfig, platform, threading
 from dataclasses import dataclass
 from urllib.request import urlretrieve
 
 
-VERSION: str = "26.57"
+VERSION: str = "26.58"
 
 
 class NitrogenDependencyError(RuntimeError):
@@ -946,8 +946,31 @@ async def require_async(pub: str, rel: str | None = None) -> object:
             f"No such submodule: '{submodule}' in publication '{pub}' release '{rel}'"
         ) from exc
 
+def _run_coroutine_from_sync(coro):
+    result: dict[str, object] = {}
+    error: dict[str, BaseException] = {}
+
+    def runner() -> None:
+        try:
+            result["value"] = asyncio.run(coro)
+        except BaseException as exc:  # pragma: no cover - exercised via tests
+            error["value"] = exc
+
+    thread = threading.Thread(target=runner, daemon=True)
+    thread.start()
+    thread.join()
+
+    if "value" in error:
+        raise error["value"]
+    return result["value"]
+
+
 def require(pub: str, rel: str | None = None) -> object:
-    return asyncio.run(require_async(pub, rel))
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(require_async(pub, rel))
+    return _run_coroutine_from_sync(require_async(pub, rel))
 
 def cleanup() -> None:
     if os.path.exists(INTERNAL_TEMP_DIR):
