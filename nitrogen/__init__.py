@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from urllib.request import urlretrieve
 
 
-VERSION: str = "26.56"
+VERSION: str = "26.57"
 
 
 class NitrogenDependencyError(RuntimeError):
@@ -913,20 +913,38 @@ async def require_async(pub: str, rel: str | None = None) -> object:
             raise ModuleNotFoundError(f"No package entry point found in publication '{pub}' release '{rel}'")
         raise ModuleNotFoundError(f"No such submodule: '{submodule}' in publication '{pub}' release '{rel}'")
 
-    spec: importlib.machinery.ModuleSpec = importlib.util.spec_from_file_location(
-        submodule or name,
-        module_path,
+    module_name = f"{name}.{submodule}" if submodule else name
+
+    package_spec = importlib.util.spec_from_file_location(
+        name,
+        os.path.join(cache_dir, "__init__.py"),
+        submodule_search_locations=[cache_dir],
     )
-    if spec is None or spec.loader is None:
-        raise ModuleNotFoundError(f"Could not load publication '{pub}' release '{rel}'")
 
-    module: object = importlib.util.module_from_spec(spec)
+    if package_spec is None or package_spec.loader is None:
+        raise ModuleNotFoundError(
+            f"Could not load publication '{pub}' release '{rel}'"
+        )
+
+    package = importlib.util.module_from_spec(package_spec)
+    sys.modules[name] = package
+
     try:
-        spec.loader.exec_module(module)  # type: ignore[arg-type]
+        package_spec.loader.exec_module(package)
     except FileNotFoundError as exc:
-        raise ModuleNotFoundError(f"No such submodule: '{submodule}' in publication '{pub}' release '{rel}'") from exc
-    return module
+        raise ModuleNotFoundError(
+            f"No package entry point found in publication '{pub}' release '{rel}'"
+        ) from exc
 
+    if submodule is None:
+        return package
+
+    try:
+        return importlib.import_module(module_name)
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            f"No such submodule: '{submodule}' in publication '{pub}' release '{rel}'"
+        ) from exc
 
 def require(pub: str, rel: str | None = None) -> object:
     return asyncio.run(require_async(pub, rel))
