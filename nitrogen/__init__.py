@@ -1,9 +1,9 @@
-import sys, zipfile, shutil, os, urllib.error, subprocess, traceback, asyncio, re, importlib.util, json, sysconfig, platform, threading
+import sys, zipfile, shutil, os, urllib.error, traceback, asyncio, re, importlib.util, json, threading, pathlib
 from dataclasses import dataclass
 from urllib.request import urlretrieve
 
 
-VERSION: str = "26.59"
+VERSION: str = "26.60"
 
 
 class NitrogenDependencyError(RuntimeError):
@@ -204,11 +204,6 @@ async def install_target(path: str, bin_dir: str | None = None, command_name: st
     target_bin_dir = bin_dir or _default_bin_dir()
     module_name = _module_name_from_root(pkg_dir)
     script_path = _write_bin_script(target_bin_dir, resolved_name, target, pkg_dir, module_name=module_name)
-
-    dep_file = os.path.join(pkg_dir, ".nitrodep")
-    if not no_deps and os.path.isfile(dep_file):
-        if "getdep" in globals() and callable(getdep):
-            await getdep(dep_file, install_root=os.path.join(pkg_dir, ".ww"), work_dir=pkg_dir, log=True, force=False)
     return {
         "command_name": resolved_name,
         "source_path": pkg_dir,
@@ -335,6 +330,8 @@ def _print_help() -> None:
     _print_command("rm <publication> [release]", "Delete one release or all installed releases for a publication.")
     _print_command("install <path> [--name <command>] [--bin <dir>] [--no-deps]", "Install a Nitrogen package from a local directory.")
     _print_command("install-cache <publication> [release] [--name <command>] [--bin <dir>]", "Install a cached publication from the Nitrogen internal cache as a command.")
+    _print_command("list", "List installed publications in Nitrogen's internal cache.")
+    _print_command("cache", "Show the total cache size and per-publication cache usage.")
     _print_command("uninstall <command> [--bin <dir>]", "Uninstall a Nitrogen package by its command name.")
     print()
     _print_section("Documentation")
@@ -347,10 +344,8 @@ def parsepub(pub: str) -> str:
         return PUBLICATION_CACHE[pub.lower()]
     return pub
 
-
 def _publication_dirname(pub: str, rel: str, root: str = "ww") -> str:
     return os.path.join(root, _publication_leaf(pub, rel))
-
 
 def _publication_leaf(pub: str, rel: str) -> str:
     pub_key: str = REVERSE_PUBLICATION_CACHE.get(pub.lower(), pub.lower())
@@ -358,16 +353,8 @@ def _publication_leaf(pub: str, rel: str) -> str:
         return pub_key
     return f"{pub_key}{rel.replace('.', '_').replace('-', '_')}"
 
-
 def _release_token(rel: str) -> str:
     return rel.replace(".", "_").replace("-", "_")
-
-
-def _dependency_file_path(path: str) -> str:
-    if path.endswith(".nitrodep"):
-        return path
-    return os.path.join(path, ".nitrodep")
-
 
 def _print_install_result(result: InstallResult, color: bool = True) -> None:
     labels: dict[str, str] = {
@@ -387,68 +374,6 @@ def _print_install_result(result: InstallResult, color: bool = True) -> None:
             print(f"{_cli(f'[{label}]', prefix, bold=True)} {line}")
         else:
             print(f"[{label}] {line}")
-
-
-def _find_nitrodep_files(root_path: str) -> list[str]:
-    if root_path.endswith(".nitrodep") and os.path.isfile(root_path):
-        return [root_path]
-    found: list[str] = []
-    for current_root, _, files in os.walk(root_path):
-        if ".nitrodep" in files:
-            found.append(os.path.join(current_root, ".nitrodep"))
-    return sorted(found)
-
-
-def _read_nitrodep_entries(dep_path: str) -> list[tuple[str, str]]:
-    if not os.path.isfile(dep_path):
-        return []
-
-    entries: list[tuple[str, str]] = []
-    with open(dep_path) as file:
-        for raw_line in file:
-            line: str = raw_line.strip()
-            if not line:
-                continue
-            parts: list[str] = line.split()
-            publication: str = parsepub(parts[0]).lower()
-            release: str = parts[1] if len(parts) > 1 else "latest"
-            entries.append((publication, release))
-    return entries
-
-
-def _write_nitrodep_entries(dep_path: str, entries: list[tuple[str, str]]) -> None:
-    parent: str = os.path.dirname(dep_path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    with open(dep_path, "w") as file:
-        if entries:
-            file.write("\n".join(f"{pub} {rel}" if rel != "latest" else pub for pub, rel in entries) + "\n")
-
-
-def _add_nitrodep_dependency(path: str, pub: str, rel: str) -> bool:
-    dep_path: str = _dependency_file_path(path)
-    dep_key: tuple[str, str] = (parsepub(pub).lower(), rel)
-    entries: list[tuple[str, str]] = _read_nitrodep_entries(dep_path)
-    if dep_key in entries:
-        return False
-    entries.append(dep_key)
-    _write_nitrodep_entries(dep_path, entries)
-    return True
-
-
-def _remove_nitrodep_dependency(path: str, pub: str, rel: str) -> bool:
-    dep_path: str = _dependency_file_path(path)
-    if not os.path.isfile(dep_path):
-        return False
-
-    dep_key: tuple[str, str] = (parsepub(pub).lower(), rel)
-    entries: list[tuple[str, str]] = _read_nitrodep_entries(dep_path)
-    filtered: list[tuple[str, str]] = [entry for entry in entries if entry != dep_key]
-    if len(filtered) == len(entries):
-        return False
-    _write_nitrodep_entries(dep_path, filtered)
-    return True
-
 
 def _remove_publication_versions(install_root: str, pub: str, rel: str | None = None) -> int:
     if not os.path.isdir(install_root):
@@ -482,7 +407,6 @@ def _remove_publication_versions(install_root: str, pub: str, rel: str | None = 
             deleted += 1
 
     return deleted
-
 
 def _parse_installed_publication_dir(dirname: str) -> tuple[str, str] | None:
     directory_name: str = dirname.lower()
@@ -642,108 +566,6 @@ async def install_async(pub: str, rel: str, reinstall: bool = True, color: bool 
         raise SystemExit(result.exit_code)
     return result
 
-
-async def _getdep_recursive(path: str, color: bool = True, log: bool = True, visited: set[str] | None = None, installed: set[tuple[str, str]] | None = None, force: bool = False, install_root: str = "ww", work_dir: str = ".") -> None:
-    dep_path: str = _dependency_file_path(path)
-    if visited is None:
-        visited = set()
-    if installed is None:
-        installed = set()
-    resolved_path: str = os.path.realpath(dep_path)
-    if resolved_path in visited:
-        return
-    visited.add(resolved_path)
-
-    if not os.path.isfile(dep_path):
-        _print_status("miss", f"No dependency file found at '{dep_path}'", "warning")
-        return
-    with open(dep_path) as file:
-        content: str = file.read()
-    deps: list[tuple[str, str]] = [(line.split()[0].strip(), line.split(maxsplit=1)[1].strip() if len(line.split(maxsplit=1)) > 1 else "latest") for line in content.split("\n") if line.strip() and not line.strip().startswith("//")]
-    if not deps:
-        if log:
-            _print_status("done", "No dependencies needed.", "success")
-        return
-    if log:
-        _print_status("deps", f"Loaded {len(deps)} dependenc{'y' if len(deps) == 1 else 'ies'} from {dep_path}", "info")
-    pending_deps: list[tuple[str, str]] = []
-    scripts_allowed: bool = "allow" if "--allow" in sys.argv else ("skip" if "--skip" in sys.argv else "deny")
-    print_tip: bool = False
-    for pub, rel in deps:
-        dep_key: tuple[str, str] = (parsepub(pub).lower(), rel)
-        if dep_key in installed:
-            continue
-        if pub.lower().startswith("script:"):
-            if scripts_allowed == "allow":
-                _print_status("script", f"Executing script dependency: {pub} {rel}", "info")
-                script_path: str = pub[len("script:"):]
-                if not os.path.isfile(script_path):
-                    _print_status("fail", f"Script file '{script_path}' not found.", "error")
-                    raise SystemExit(1)
-                try:
-                    with open(script_path) as script_file:
-                        script_content: str = script_file.read()
-                    exec(script_content, {"__name__": "__main__"})
-                except Exception:
-                    _print_status("fail", f"Error executing script '{script_path}':\n{traceback.format_exc()}", "error")
-                    raise SystemExit(1)
-            elif scripts_allowed == "skip":
-                _print_status("skip", f"Skipping script dependency: {pub} {rel}", "muted")
-            else:
-                _print_status("deny", f"Script dependency '{pub}' is not allowed. Use '--allow' to allow or '--skip' to skip.", "error")
-                raise SystemExit(1)
-            continue
-        installed.add(dep_key)
-        pending_deps.append((pub, rel))
-    if print_tip:
-        _print_status("deny", "To allow scripts, re-run with '--allow'. To skip scripts, re-run with '--skip'.", "info")
-    tasks: list[asyncio.Task] = [_queue_install(pub, rel, (rel == "latest") or force, install_root, work_dir) for pub, rel in pending_deps]
-    results: list[InstallResult] = await asyncio.gather(*tasks)
-    for result in results:
-        _print_install_result(result, color)
-
-    failures: int = sum(1 for result in results if result.exit_code)
-    if failures:
-        if log:
-            _print_status("fail", f"Dependency install finished with {failures} failure{'s' if failures != 1 else ''}.", "error")
-        raise SystemExit(1)
-
-    for pub, rel in deps:
-        installed_dep_path: str = _dependency_file_path(_publication_dirname(parsepub(pub), rel, install_root))
-        await _getdep_recursive(installed_dep_path, color=color, log=False, visited=visited, installed=installed, install_root=install_root, work_dir=work_dir)
-    if log:
-        _print_status("done", "All dependencies are ready.", "success")
-                
-async def getdep(path: str, color: bool = True, log: bool = True, force: bool = False, install_root: str = "ww", work_dir: str = ".") -> None:
-    await _getdep_recursive(path, color=color, log=log, force=force, install_root=install_root, work_dir=work_dir)
-
-
-async def getdep_everywhere(path: str, color: bool = True, force: bool = False, install_root: str = "ww", work_dir: str = ".") -> None:
-    dep_files: list[str] = _find_nitrodep_files(path)
-    if not dep_files:
-        _print_status("miss", f"No .nitrodep files found under '{path}'.", "warning")
-        return
-
-    _print_status("deps", f"Found {len(dep_files)} .nitrodep file{'s' if len(dep_files) != 1 else ''} under '{path}'.", "info")
-    visited: set[str] = set()
-    installed: set[tuple[str, str]] = set()
-    for dep_file in dep_files:
-        await _getdep_recursive(dep_file, color=color, log=True, visited=visited, installed=installed, force=force, install_root=install_root, work_dir=work_dir)
-
-
-async def _install_subdependencies(pub: str, rel: str, color: bool = True, install_root: str = "ww", work_dir: str = ".", emit: bool = True) -> None:
-    resolved_pub: str = parsepub(pub)
-    dep_path: str = _dependency_file_path(_publication_dirname(resolved_pub, rel, install_root))
-    if emit:
-        _print_status("deps", f"Checking sub-dependencies for {resolved_pub.lower()} {rel}", "info")
-    if not os.path.isfile(dep_path):
-        if emit:
-            _print_status("info", "No sub-dependencies declared.", "muted")
-        return
-    await getdep(dep_path, color=color, log=emit, install_root=install_root, work_dir=work_dir)
-    if emit:
-        _print_status("done", f"Sub-dependencies for {resolved_pub.lower()} {rel} are ready.", "success")
-        
 async def main() -> None:
     if len(sys.argv) == 1:
         print(_cli(f"Nitrogen v{VERSION}", CLI_INFO, bold=True))
@@ -768,9 +590,7 @@ async def main() -> None:
                 sys.exit(1)
             pub = sys.argv[2]
             rel = sys.argv[3] if len(sys.argv) > 3 else "latest"
-            result = await install_async(pub, rel, install_root=INTERNAL_WW_DIR, work_dir=INTERNAL_TEMP_DIR)
-            if not result.exit_code:
-                await _install_subdependencies(pub, rel, install_root=INTERNAL_WW_DIR, work_dir=INTERNAL_TEMP_DIR)
+            await install_async(pub, rel, install_root=INTERNAL_WW_DIR, work_dir=INTERNAL_TEMP_DIR)
         case "rm":
             if len(sys.argv) == 2:
                 _print_status("help", "Usage: n2 rm <publication> [release]", "warning")
@@ -780,7 +600,7 @@ async def main() -> None:
             if pub.strip() == "all":
                 if os.path.isdir(INTERNAL_WW_DIR):
                     for entry in os.listdir(INTERNAL_WW_DIR):
-                        if entry in ("len", "temp"):
+                        if entry == "temp":
                             continue
                         entry_path: str = os.path.join(INTERNAL_WW_DIR, entry)
                         if os.path.isdir(entry_path):
@@ -805,6 +625,34 @@ async def main() -> None:
                         _print_status("miss", f"Publication '{pub.capitalize()}' is not installed here. Are you sure you spelled it right?", "warning")
             else:
                 _print_status("miss", f"Could not find publication '{pub.capitalize()}'. Are you sure you spelled it right?", "warning")
+        case "list":
+            _print_status("info", "Installed publications:", "info")
+            for entry in os.listdir(INTERNAL_WW_DIR):
+                if entry == "temp":
+                    continue
+                entry_path: str = os.path.join(INTERNAL_WW_DIR, entry)
+                if os.path.isdir(entry_path):
+                    name_split: list[str] = re.match(r'([A-Za-z]*)(.*)', entry).groups()
+                    _print_status("info", f"{PUBLICATION_CACHE.get(name_split[0], 'unknown').capitalize()}{' ' + name_split[1].replace('_', '.') if name_split[1] else ''} ({entry}) at {entry_path}", "info")
+        case "cache":
+            _print_status("hint", "Trying to list publications in the cache? Use `n2 list` instead.", "info")
+            def human_size(size: float) -> str:
+                for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+                    if size < 1024:
+                        return f"{size:.2f}{unit}"
+                    size /= 1024
+                return f"{size:.2f}PiB"
+            total_cache_size = sum(f.stat().st_size for f in pathlib.Path(INTERNAL_WW_DIR).rglob("*") if f.is_file())
+            _print_status("info", f"Total cache size (includes all installed publications): {human_size(total_cache_size)}", "info")
+            sizes: dict = {}
+            for path in pathlib.Path(INTERNAL_WW_DIR).iterdir():
+                if path.is_dir():
+                    sizes[path] = sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+            total = sum(sizes.values())
+            for path, size in sorted(sizes.items(), key=lambda x: x[1], reverse=True):
+                percent = (size / total * 100) if total else 0
+                _print_status("info", f"{path.name:<30} {human_size(size):>10}  {percent:>6.2f}%", "info")
+            _print_status("hint", "Use `n2 rm all` to clear the cache or remove publications one by one with `n2 rm <publication>`.", "info")
         case "install":
             if len(sys.argv) == 2:
                 _print_status("help", "Usage: n2 install <path> [--name <command>] [--bin <dir>] [--no-deps]", "warning")
@@ -904,7 +752,6 @@ async def require_async(pub: str, rel: str | None = None) -> object:
             raise NitrogenDependencyError(
                 f"Could not install '{pub}' release '{rel}' because the dependency is unavailable or the site is unreachable: {lines}"
             )
-        await _install_subdependencies(pub, rel, emit=False)
 
     name: str = _publication_leaf(pub, rel)
     module_path = os.path.join(cache_dir, f"{submodule.replace('.', os.sep)}.py" if submodule else "__init__.py")

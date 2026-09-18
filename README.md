@@ -45,6 +45,18 @@ Install a cached publication from Nitrogen's internal cache as a command without
 
 > `n2 install-cache magnesium 26.5 --name mg --bin ./bin`
 
+### `list`
+
+List installed publications in Nitrogen's internal cache.
+
+> `n2 list`
+
+### `cache`
+
+Show the total cache size and per-publication cache usage for the internal cache directory.
+
+> `n2 cache`
+
 ### `uninstall <command> [--bin <dir>]`
 
 Uninstall a Nitrogen package by its command name. If the `--bin` option is not specified, the default bin directory will be used.

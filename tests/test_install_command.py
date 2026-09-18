@@ -231,6 +231,17 @@ def test_help_and_docs_use_documented_cache_install_command(capsys):
     assert "--from-cache" not in readme
 
 
+def test_help_and_docs_include_list_and_cache_commands(capsys):
+    nitrogen._print_help()
+    captured = capsys.readouterr().out.lower()
+    assert "list" in captured
+    assert "cache" in captured
+
+    readme = open("README.md", "r", encoding="utf-8").read().lower()
+    assert "### `list`" in readme
+    assert "### `cache`" in readme
+
+
 def test_help_and_docs_do_not_reference_extensions_or_n2x(capsys):
     nitrogen._print_help()
     captured = capsys.readouterr().out
