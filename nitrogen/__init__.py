@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from urllib.request import urlretrieve
 
 
-VERSION: str = "26.58"
+VERSION: str = "26.59"
 
 
 class NitrogenDependencyError(RuntimeError):
@@ -939,12 +939,7 @@ async def require_async(pub: str, rel: str | None = None) -> object:
     if submodule is None:
         return package
 
-    try:
-        return importlib.import_module(module_name)
-    except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError(
-            f"No such submodule: '{submodule}' in publication '{pub}' release '{rel}'"
-        ) from exc
+    return importlib.import_module(module_name)
 
 def _run_coroutine_from_sync(coro):
     result: dict[str, object] = {}
