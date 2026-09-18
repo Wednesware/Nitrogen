@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from urllib.request import urlretrieve
 
 
-VERSION: str = "26.60"
+VERSION: str = "26.61"
 
 
 class NitrogenDependencyError(RuntimeError):
@@ -234,7 +234,8 @@ def install_cached_publication(pub: str, rel: str = "latest", *, bin_dir: str | 
 
     resolved_name = command_name or resolved_pub.lower()
     target_bin_dir = bin_dir or _default_bin_dir()
-    script_path = _write_bin_script(target_bin_dir, resolved_name, target, publication_dir)
+    module_name = _module_name_from_root(publication_dir)
+    script_path = _write_bin_script(target_bin_dir, resolved_name, target, publication_dir, module_name=module_name)
     return {
         "command_name": resolved_name,
         "publication": resolved_pub,

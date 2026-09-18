@@ -189,6 +189,30 @@ def test_install_cached_publication_creates_wrapper_from_internal_cache(tmp_path
     assert "-m mg" in content or "__main__" in content
 
 
+def test_install_cached_publication_uses_module_execution_for_package_entrypoints(tmp_path):
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+
+    pub_dir = cache_dir / "b"
+    pub_dir.mkdir()
+    (pub_dir / "__init__.py").write_text("VALUE = 7\n", encoding="utf-8")
+    (pub_dir / "__main__.py").write_text("from . import VALUE\nprint(VALUE)\n", encoding="utf-8")
+
+    nitrogen.INTERNAL_WW_DIR = str(cache_dir)
+
+    result = nitrogen.install_cached_publication("b", "latest", bin_dir=str(bin_dir), command_name="boron")
+    assert result["command_name"] == "boron"
+
+    wrapper = bin_dir / "boron"
+    content = wrapper.read_text(encoding="utf-8")
+    assert "-m b" in content
+
+    completed = subprocess.run([str(wrapper)], capture_output=True, text=True, check=True)
+    assert "7" in completed.stdout
+
+
 def test_build_and_compat_commands_are_removed_from_cli_and_docs(capsys):
     assert not hasattr(nitrogen, "build")
     assert not hasattr(nitrogen, "_apply_compat")
