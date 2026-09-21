@@ -33,17 +33,17 @@ Delete one release or all installed releases for a publication. If no release is
 
 > `n2 rm magnesium 26.5`
 
-### `install <path> [--name <command>] [--bin <dir>] [--no-deps]`
+### `install <publication> [release]`
 
-Install a Nitrogen package from a local directory.
+Install a cached Wednesware publication via `pipx`. Local package directories are not supported; use `pipx` for publication installs only.
 
-> `n2 install ./my_package --name my_command --bin ./bin --no-deps`
+> `n2 install b 26.5`
 
-### `install-cache <publication> [release] [--name <command>] [--bin <dir>]`
+### `uninstall <publication> [release]`
 
-Install a cached publication from Nitrogen's internal cache as a command without re-downloading.
+Uninstall a Nitrogen package by its publication name and optional release from the `pipx` cache.
 
-> `n2 install-cache magnesium 26.5 --name mg --bin ./bin`
+> `n2 uninstall magnesium 26.5x`
 
 ### `list`
 
@@ -57,11 +57,6 @@ Show the total cache size and per-publication cache usage for the internal cache
 
 > `n2 cache`
 
-### `uninstall <command> [--bin <dir>]`
-
-Uninstall a Nitrogen package by its command name. If the `--bin` option is not specified, the default bin directory will be used.
-
-> `n2 uninstall my_command --bin ./bin`
 
 ## Documentation
 

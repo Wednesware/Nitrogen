@@ -18,97 +18,103 @@ def _make_package(project_dir: str, *, entry: str = "main.py"):
         handle.write("print('hello')\n")
 
 
-def test_install_requires_nitropkg_directory():
-    async def run():
-        with tempfile.TemporaryDirectory() as tmpdir:
-            project_dir = os.path.join(tmpdir, "demo-app")
-            os.makedirs(project_dir)
-            with open(os.path.join(project_dir, "main.py"), "w", encoding="utf-8") as handle:
-                handle.write("print('no package here')\n")
-
-            try:
-                await nitrogen.install_target(project_dir, bin_dir=os.path.join(tmpdir, "bin"), no_deps=True)
-                assert False, "Expected ValueError for a directory without .nitropkg"
-            except ValueError as exc:
-                assert ".nitropkg" in str(exc)
-
-    asyncio.run(run())
-
-
-def test_install_creates_executable_wrapper_in_bin_dir():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        project_dir = os.path.join(tmpdir, "demo-app")
-        os.makedirs(project_dir)
-        _make_package(project_dir)
-
-        bin_dir = os.path.join(tmpdir, "bin")
-        os.makedirs(bin_dir)
-
-        async def run():
-            result = await nitrogen.install_target(project_dir, bin_dir=bin_dir, no_deps=True)
-
-            assert result["command_name"] == "demo-app"
-            wrapper = os.path.join(bin_dir, "demo-app")
-            assert os.path.exists(wrapper)
-            assert os.access(wrapper, os.X_OK)
-
-            with open(wrapper, "r", encoding="utf-8") as handle:
-                content = handle.read()
-            assert "nitropkg-managed" in content or "demo-app" in content
-
-        asyncio.run(run())
-
-
-def test_install_uses_module_execution_for_package_entrypoints(tmp_path):
-    project_dir = tmp_path / "myproject"
+def test_install_target_rejects_non_cached_project_directory(tmp_path):
+    project_dir = tmp_path / "demo-app"
     project_dir.mkdir()
-    (project_dir / ".nitropkg").write_text(json.dumps({"name": "myproject", "entry": "__main__.py"}), encoding="utf-8")
-    (project_dir / "__init__.py").write_text("x = 20\n", encoding="utf-8")
-    (project_dir / "__main__.py").write_text("from . import x\nprint(x)\n", encoding="utf-8")
+    (project_dir / ".nitropkg").write_text(json.dumps({"name": "demo-app", "entry": "main.py"}), encoding="utf-8")
+    (project_dir / "main.py").write_text("print('hello')\n", encoding="utf-8")
 
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-
-    async def run():
-        result = await nitrogen.install_target(str(project_dir), bin_dir=str(bin_dir), no_deps=True)
-        assert result["command_name"] == "myproject"
-
-        wrapper = bin_dir / "myproject"
-        assert wrapper.exists()
-        content = wrapper.read_text(encoding="utf-8")
-        assert "-m myproject" in content
-
-        completed = subprocess.run([str(wrapper)], capture_output=True, text=True, check=True)
-        assert "20" in completed.stdout
-
-    asyncio.run(run())
+    with pytest.raises(ValueError, match="cached Wednesware publication|direct local package installs are disabled|pipx"):
+        asyncio.run(nitrogen.install_target(str(project_dir), no_deps=True))
 
 
-def test_uninstall_removes_only_nitropkg_wrappers():
-    async def run():
-        with tempfile.TemporaryDirectory() as tmpdir:
-            project_dir = os.path.join(tmpdir, "demo-app")
-            os.makedirs(project_dir)
-            _make_package(project_dir)
+def test_help_restricts_install_to_publications_only(capsys):
+    nitrogen._print_help()
+    captured = capsys.readouterr().out.lower()
+    assert "install <publication> [release]" in captured
+    assert "path|publication" not in captured
 
-            bin_dir = os.path.join(tmpdir, "bin")
-            os.makedirs(bin_dir)
 
-            installed = await nitrogen.install_target(project_dir, bin_dir=bin_dir, no_deps=True)
-            uninstall_result = nitrogen.uninstall_target(installed["command_name"], bin_dir=bin_dir)
+def test_uninstall_target_uses_pipx_only(monkeypatch):
+    calls = []
 
-            assert uninstall_result["removed"] is True
-            assert not os.path.exists(os.path.join(bin_dir, installed["command_name"]))
+    def fake_which(name):
+        return "/usr/bin/pipx" if name == "pipx" else None
 
-            rogue_wrapper = os.path.join(bin_dir, "rogue")
-            with open(rogue_wrapper, "w", encoding="utf-8") as handle:
-                handle.write("#!/usr/bin/env python\nprint('not managed')\n")
+    def fake_run(cmd, capture_output, text, check=False):
+        calls.append(cmd)
+        class Result:
+            returncode = 0
+        return Result()
 
-            refusal = nitrogen.uninstall_target("rogue", bin_dir=bin_dir)
-            assert refusal["removed"] is False
-            assert refusal["reason"] == "refusing to remove a non-nitropkg command"
+    monkeypatch.setattr(nitrogen.shutil, "which", fake_which)
+    monkeypatch.setattr(nitrogen.subprocess, "run", fake_run)
 
-    asyncio.run(run())
+    result = nitrogen.uninstall_target("demo-app")
+
+    assert result["removed"] is True
+    assert "bin_dir" not in result
+    assert calls == [["pipx", "uninstall", "demo-app"]]
+
+
+def test_uninstall_target_resolves_publication_aliases(monkeypatch):
+    calls = []
+
+    def fake_which(name):
+        return "/usr/bin/pipx" if name == "pipx" else None
+
+    def fake_run(cmd, capture_output, text, check=False):
+        calls.append(cmd)
+        class Result:
+            returncode = 0
+        return Result()
+
+    monkeypatch.setattr(nitrogen.shutil, "which", fake_which)
+    monkeypatch.setattr(nitrogen.subprocess, "run", fake_run)
+
+    result = nitrogen.uninstall_target("mg")
+
+    assert result["removed"] is True
+    assert calls == [["pipx", "uninstall", "magnesium"]]
+
+
+def test_load_nitropkg_removes_name_field(tmp_path):
+    pkg_dir = tmp_path / "demo-pkg"
+    pkg_dir.mkdir()
+    (pkg_dir / ".nitropkg").write_text(json.dumps({"name": "legacy-name", "entry": "main.py"}), encoding="utf-8")
+
+    metadata = nitrogen._load_nitropkg(str(pkg_dir))
+
+    assert metadata == {"entry": "main.py"}
+
+
+def test_install_cached_publication_ignores_nitropkg_name_and_uses_publication_name(tmp_path, monkeypatch):
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    pub_dir = cache_dir / "mg26_5"
+    pub_dir.mkdir()
+    (pub_dir / ".nitropkg").write_text(json.dumps({"name": "legacy-name", "entry": "__main__.py"}), encoding="utf-8")
+    (pub_dir / "__main__.py").write_text("print('cached publication run')\n", encoding="utf-8")
+
+    monkeypatch.setattr(nitrogen, "INTERNAL_WW_DIR", str(cache_dir))
+
+    calls = []
+
+    def fake_which(name):
+        return "/usr/bin/pipx" if name == "pipx" else None
+
+    def fake_run(cmd, capture_output, text, check=False, env=None):
+        calls.append(cmd)
+        return type("Result", (), {"returncode": 0})()
+
+    monkeypatch.setattr(nitrogen.shutil, "which", fake_which)
+    monkeypatch.setattr(nitrogen.subprocess, "run", fake_run)
+
+    result = nitrogen.install_cached_publication("mg", "26.5")
+
+    assert result["command_name"] == "magnesium"
+    assert calls[0] == ["pipx", "uninstall", "magnesium"]
+    assert calls[1] == ["pipx", "install", str(pub_dir), "--force"]
 
 
 def test_require_uses_cached_internal_install_without_redownloading(monkeypatch, tmp_path):
@@ -167,34 +173,39 @@ def test_require_raises_custom_error_when_site_is_unreachable(monkeypatch):
         asyncio.run(nitrogen.require_async("mg", "26.5"))
 
 
-def test_install_cached_publication_creates_wrapper_from_internal_cache(tmp_path):
+def test_install_cached_publication_uses_pipx_without_custom_bin_dir(tmp_path, monkeypatch):
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-
     pub_dir = cache_dir / "mg26_5"
     pub_dir.mkdir()
     (pub_dir / "__main__.py").write_text("print('cached publication run')\n", encoding="utf-8")
 
     nitrogen.INTERNAL_WW_DIR = str(cache_dir)
 
-    result = nitrogen.install_cached_publication("mg", "26.5", bin_dir=str(bin_dir), command_name="mg-run")
+    calls = []
+
+    def fake_which(name):
+        return "/usr/bin/pipx" if name == "pipx" else None
+
+    def fake_run(cmd, capture_output, text, check=False, env=None):
+        calls.append(cmd)
+        return type("Result", (), {"returncode": 0})()
+
+    monkeypatch.setattr(nitrogen.shutil, "which", fake_which)
+    monkeypatch.setattr(nitrogen.subprocess, "run", fake_run)
+
+    result = nitrogen.install_cached_publication("mg", "26.5", command_name="mg-run")
 
     assert result["command_name"] == "mg-run"
-    wrapper = bin_dir / "mg-run"
-    assert wrapper.exists()
-    assert os.access(wrapper, os.X_OK)
-    content = wrapper.read_text(encoding="utf-8")
-    assert "-m mg" in content or "__main__" in content
+    assert "bin_dir" not in result
+    assert "bin_path" not in result
+    assert calls[0] == ["pipx", "uninstall", "mg-run"]
+    assert calls[1] == ["pipx", "install", str(pub_dir), "--force"]
 
 
-def test_install_cached_publication_uses_module_execution_for_package_entrypoints(tmp_path):
+def test_install_cached_publication_uses_module_execution_for_package_entrypoints(tmp_path, monkeypatch):
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-
     pub_dir = cache_dir / "b"
     pub_dir.mkdir()
     (pub_dir / "__init__.py").write_text("VALUE = 7\n", encoding="utf-8")
@@ -202,15 +213,17 @@ def test_install_cached_publication_uses_module_execution_for_package_entrypoint
 
     nitrogen.INTERNAL_WW_DIR = str(cache_dir)
 
-    result = nitrogen.install_cached_publication("b", "latest", bin_dir=str(bin_dir), command_name="boron")
+    monkeypatch.setattr(nitrogen.shutil, "which", lambda name: "/usr/bin/pipx" if name == "pipx" else None)
+
+    def fake_run(cmd, capture_output, text, check=False, env=None):
+        return type("Result", (), {"returncode": 0})()
+
+    monkeypatch.setattr(nitrogen.subprocess, "run", fake_run)
+
+    result = nitrogen.install_cached_publication("b", "latest", command_name="boron")
     assert result["command_name"] == "boron"
-
-    wrapper = bin_dir / "boron"
-    content = wrapper.read_text(encoding="utf-8")
-    assert "-m b" in content
-
-    completed = subprocess.run([str(wrapper)], capture_output=True, text=True, check=True)
-    assert "7" in completed.stdout
+    assert "bin_dir" not in result
+    assert "bin_path" not in result
 
 
 def test_build_and_compat_commands_are_removed_from_cli_and_docs(capsys):
@@ -244,15 +257,17 @@ def test_library_and_internal_commands_are_removed_from_cli_and_docs(capsys):
     assert "rminternal" not in readme
 
 
-def test_help_and_docs_use_documented_cache_install_command(capsys):
+def test_help_and_docs_do_not_reference_install_cache(capsys):
     nitrogen._print_help()
     captured = capsys.readouterr().out.lower()
-    assert "install-cache" in captured
+    assert "install-cache" not in captured
     assert "--from-cache" not in captured
+    assert "pipx" in captured
 
     readme = open("README.md", "r", encoding="utf-8").read().lower()
-    assert "install-cache" in readme
+    assert "install-cache" not in readme
     assert "--from-cache" not in readme
+    assert "pipx" in readme
 
 
 def test_help_and_docs_include_list_and_cache_commands(capsys):

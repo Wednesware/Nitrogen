@@ -1,0 +1,6 @@
+{
+  "name": "boron",
+  "version": "26.1",
+  "author": "Wednesware",
+  "entry": "../__main__.py"
+}

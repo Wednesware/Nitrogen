@@ -1,9 +1,9 @@
-import sys, zipfile, shutil, os, urllib.error, traceback, asyncio, re, importlib.util, json, threading, pathlib
+import sys, zipfile, shutil, os, urllib.error, traceback, asyncio, re, importlib.util, json, threading, pathlib, subprocess
 from dataclasses import dataclass
 from urllib.request import urlretrieve
 
 
-VERSION: str = "26.61"
+VERSION: str = "26.62"
 
 
 class NitrogenDependencyError(RuntimeError):
@@ -73,37 +73,6 @@ INTERNAL_TEMP_DIR: str = os.path.join(os.path.dirname(__file__), "temp")
 
 running_installs: dict[tuple[str, str, str], asyncio.Task] = {}
 
-def _default_bin_dir() -> str:
-    user_home = os.path.expanduser("~")
-    candidates: list[str] = []
-    if os.name == "nt":
-        candidates.extend([
-            os.path.join(user_home, "bin"),
-            os.path.join(user_home, "AppData", "Local", "Programs", "Python", "Scripts"),
-            os.path.join(user_home, "AppData", "Roaming", "Python", "Scripts"),
-        ])
-    else:
-        candidates.extend([
-            os.path.join(user_home, ".local", "bin"),
-            os.path.join(sys.prefix, "bin"),
-            os.path.join(user_home, "bin"),
-            "/usr/local/bin",
-            "/usr/bin",
-        ])
-    seen: set[str] = set()
-    ordered: list[str] = []
-    for candidate in candidates:
-        resolved = os.path.abspath(candidate)
-        if resolved not in seen:
-            seen.add(resolved)
-            ordered.append(resolved)
-    for candidate in ordered:
-        if candidate and os.access(candidate, os.W_OK):
-            return candidate
-    if os.name == "nt":
-        return os.path.join(user_home, "AppData", "Local", "Programs", "Python", "Scripts")
-    return os.path.join(user_home, ".local", "bin")
-
 def _load_nitropkg(path: str) -> dict:
     pkg_dir = os.path.abspath(path)
     if not os.path.isdir(pkg_dir):
@@ -118,6 +87,8 @@ def _load_nitropkg(path: str) -> dict:
         raise ValueError(f".nitropkg is not valid JSON: {pkg_file}") from exc
     if not isinstance(metadata, dict):
         raise ValueError(f".nitropkg must contain a JSON object: {pkg_file}")
+    metadata = dict(metadata)
+    metadata.pop("name", None)
     return metadata
 
 
@@ -162,131 +133,224 @@ def _module_name_from_root(root: str) -> str | None:
     return None
 
 
-def _write_bin_script(bin_dir: str, command_name: str, target: str, root: str, module_name: str | None = None) -> str:
-    os.makedirs(bin_dir, exist_ok=True)
-    script_path = os.path.join(bin_dir, command_name)
-    run_target = target
-    if module_name:
-        run_target = f"-m {module_name}"
-
-    if os.name == "nt":
-        script_path += ".cmd"
-        pythonpath = os.pathsep.join(_as_path_list(root))
-        script_content = (
-            "@echo off\r\n"
-            "setlocal\r\n"
-            "rem nitropkg-managed\r\n"
-            f"rem nitropkg-root={root}\r\n"
-            f"set \"PYTHONPATH={pythonpath};%PYTHONPATH%\"\r\n"
-            f'"{sys.executable}" {run_target} %*\r\n'
-        )
-        with open(script_path, "w", encoding="utf-8", newline="") as handle:
-            handle.write(script_content)
-        return script_path
-
-    script_content = "#!/usr/bin/env sh\n"
-    script_content += "set -eu\n"
-    script_content += "# nitropkg-managed\n"
-    script_content += f"# nitropkg-root={root}\n"
-    script_content += f"export PYTHONPATH='{os.pathsep.join(_as_path_list(root))}:$PYTHONPATH'\n"
-    script_content += f'exec "{sys.executable}" {run_target} "$@"\n'
-    with open(script_path, "w", encoding="utf-8") as handle:
-        handle.write(script_content)
-    os.chmod(script_path, os.stat(script_path).st_mode | 0o111)
-    return script_path
+def _sanitize_python_name(value: str) -> str:
+    sanitized = re.sub(r"[^A-Za-z0-9_.-]+", "-", value.strip())
+    sanitized = sanitized.strip("-_.")
+    return sanitized or "nitrogen-app"
 
 
-async def install_target(path: str, bin_dir: str | None = None, command_name: str | None = None, no_deps: bool = False) -> dict:
-    pkg_dir = os.path.abspath(path)
-    metadata = _load_nitropkg(pkg_dir)
-    resolved_name = command_name or metadata.get("name") or metadata.get("command") or os.path.basename(pkg_dir)
-    target = _resolve_nitropkg_entry(pkg_dir, metadata)
-    target_bin_dir = bin_dir or _default_bin_dir()
-    module_name = _module_name_from_root(pkg_dir)
-    script_path = _write_bin_script(target_bin_dir, resolved_name, target, pkg_dir, module_name=module_name)
+def _build_entry_wrapper(entry: str, pkg_dir: str) -> str:
+    entry_value = entry.replace("\\", "/")
+    pkg_root = os.path.abspath(pkg_dir)
+    package_name = os.path.basename(pkg_root).replace("-", "_").replace(".", "_") or "nitrogen_app"
+    module_path = os.path.join(pkg_root, "__main__.py") if os.path.isfile(os.path.join(pkg_root, "__main__.py")) else os.path.join(pkg_root, "main.py")
+    wrapper = f"""
+import os
+import runpy
+import sys
+
+ROOT = {pkg_root!r}
+ENTRY = {entry_value!r}
+PACKAGE_NAME = {package_name!r}
+MODULE_PATH = {module_path!r}
+
+
+def main() -> None:
+    entry_path = os.path.join(ROOT, ENTRY)
+    if os.path.isfile(entry_path):
+        if os.path.basename(entry_path) == "__main__.py" and os.path.isfile(os.path.join(ROOT, "__init__.py")):
+            sys.path.insert(0, os.path.dirname(ROOT))
+            runpy.run_module(PACKAGE_NAME, run_name="__main__")
+            return
+        runpy.run_path(entry_path, run_name="__main__")
+        return
+    if os.path.isfile(MODULE_PATH):
+        sys.path.insert(0, os.path.dirname(ROOT))
+        runpy.run_module(PACKAGE_NAME, run_name="__main__")
+        return
+    raise FileNotFoundError(f"No entry script found for package at {{ROOT!r}}")
+"""
+    return wrapper
+
+
+def _infer_package_metadata(pkg_dir: str, cmd_name: str | None = None, entry: str | None = None) -> dict:
+    pkg_name = os.path.basename(os.path.abspath(pkg_dir)) or "nitrogen-app"
+    resolved_entry = entry or next((candidate for candidate in ("__main__.py", "main.py", "app.py", "run.py") if os.path.isfile(os.path.join(pkg_dir, candidate))), None)
     return {
-        "command_name": resolved_name,
-        "source_path": pkg_dir,
-        "root": pkg_dir,
-        "target": target,
-        "bin_dir": os.path.abspath(target_bin_dir),
-        "bin_path": os.path.abspath(script_path),
-        "metadata": metadata,
+        "name": cmd_name or pkg_name,
+        "command": cmd_name or pkg_name,
+        "entry": resolved_entry,
+        "version": "0.1.0",
+        "description": f"Nitrogen package {pkg_name}",
+        "requires-python": ">=3.12",
     }
 
 
-def install_cached_publication(pub: str, rel: str = "latest", *, bin_dir: str | None = None, command_name: str | None = None, cache_root: str | None = None) -> dict:
-    resolved_pub = parsepub(pub)
-    target_root = cache_root or INTERNAL_WW_DIR
-    publication_dir = os.path.join(target_root, _publication_leaf(resolved_pub, rel))
-    if not os.path.isdir(publication_dir):
-        raise FileNotFoundError(f"Publication '{resolved_pub}' release '{rel}' is not installed in the internal cache at '{publication_dir}'.")
-
+def _resolve_cached_publication_entry(publication_dir: str, subpath: str | None = None) -> str:
+    if subpath:
+        cleaned = subpath.replace("\\", "/").strip("/")
+        if cleaned.endswith(".py"):
+            candidate = os.path.join(publication_dir, *cleaned.split("/"))
+            if os.path.isfile(candidate):
+                return candidate
+        pieces = [part for part in cleaned.split("/") if part]
+        if pieces:
+            candidate = os.path.join(publication_dir, *pieces)
+            if os.path.isfile(candidate):
+                return candidate
+            package_candidate = os.path.join(candidate, "__main__.py")
+            if os.path.isfile(package_candidate):
+                return package_candidate
+            file_candidate = candidate + ".py"
+            if os.path.isfile(file_candidate):
+                return file_candidate
     candidates = [
         os.path.join(publication_dir, "__main__.py"),
         os.path.join(publication_dir, "main.py"),
         os.path.join(publication_dir, "app.py"),
         os.path.join(publication_dir, "run.py"),
     ]
-    target = next((candidate for candidate in candidates if os.path.isfile(candidate)), None)
-    if target is None:
-        raise ValueError(f"No executable entry point was found for cached publication '{resolved_pub}' release '{rel}' in '{publication_dir}'.")
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    raise ValueError(f"No executable entry point was found in cached publication '{publication_dir}'.")
 
-    resolved_name = command_name or resolved_pub.lower()
-    target_bin_dir = bin_dir or _default_bin_dir()
-    module_name = _module_name_from_root(publication_dir)
-    script_path = _write_bin_script(target_bin_dir, resolved_name, target, publication_dir, module_name=module_name)
+
+def _write_pyproject_toml(pkg_dir: str, cmd_name: str, metadata: dict | None = None) -> str:
+    metadata = metadata or _infer_package_metadata(pkg_dir, cmd_name)
+    pkg_name = _sanitize_python_name(cmd_name or metadata.get("name") or metadata.get("command") or os.path.basename(pkg_dir))
+    entry = metadata.get("entry") or metadata.get("main") or metadata.get("script") or next((candidate for candidate in ("__main__.py", "main.py", "app.py", "run.py") if os.path.isfile(os.path.join(pkg_dir, candidate))), None)
+    if entry is None:
+        raise ValueError(f"No valid entry script found in package directory '{pkg_dir}'")
+    package_dir = os.path.abspath(pkg_dir)
+    projected_root = os.path.basename(package_dir) or "nitrogen-app"
+    projected_name = _sanitize_python_name(projected_root)
+    wrapper_path = os.path.join(package_dir, "nitrogen_entry.py")
+    with open(wrapper_path, "w", encoding="utf-8") as handle:
+        handle.write(_build_entry_wrapper(entry, package_dir))
+
+    pyproject_path = os.path.join(package_dir, "pyproject.toml")
+    with open(pyproject_path, "w", encoding="utf-8") as handle:
+        handle.write(
+            "[build-system]\n"
+            "requires = [\"setuptools>=68\"]\n"
+            "build-backend = \"setuptools.build_meta\"\n\n"
+            "[project]\n"
+            f"name = \"{_sanitize_python_name(pkg_name)}\"\n"
+            f"version = \"{metadata.get('version', '0.1.0')}\"\n"
+            f"description = \"{metadata.get('description', metadata.get('name', projected_name))}\"\n"
+            f"requires-python = \"{metadata.get('requires-python', '>=3.12')}\"\n\n"
+            "[project.scripts]\n"
+            f"{cmd_name or pkg_name} = \"nitrogen_entry:main\"\n\n"
+            "[tool.setuptools]\n"
+            "py-modules = [\"nitrogen_entry\"]\n"
+        )
+    return pyproject_path
+
+
+def _install_via_pipx(pkg_dir: str, command_name: str | None = None, metadata: dict | None = None) -> dict:
+    if shutil.which("pipx") is None:
+        raise RuntimeError("pipx is not installed or not on PATH")
+
+    if metadata is None:
+        metadata = _load_nitropkg(pkg_dir) if os.path.isfile(os.path.join(pkg_dir, ".nitropkg")) else _infer_package_metadata(pkg_dir, command_name)
+    else:
+        metadata = dict(metadata)
+        metadata.pop("name", None)
+
+    resolved_name = command_name or metadata.get("command") or metadata.get("name") or os.path.basename(pkg_dir)
+    metadata["command"] = resolved_name
+    metadata["name"] = resolved_name
+    pyproject_path = _write_pyproject_toml(pkg_dir, resolved_name, metadata)
+    env = os.environ.copy()
+    try:
+        subprocess.run(["pipx", "uninstall", resolved_name], capture_output=True, text=True, env=env, check=False)
+        subprocess.run(["pipx", "install", pkg_dir, "--force"], check=True, capture_output=True, text=True, env=env)
+    finally:
+        for cleanup_path in (pyproject_path, os.path.join(pkg_dir, "nitrogen_entry.py")):
+            if os.path.exists(cleanup_path):
+                os.remove(cleanup_path)
+
+    if os.path.isfile(os.path.join(pkg_dir, ".nitropkg")):
+        target = _resolve_nitropkg_entry(pkg_dir, metadata)
+    else:
+        entry_name = metadata.get("entry") or metadata.get("main") or metadata.get("script")
+        fallback = "__main__.py" if os.path.isfile(os.path.join(pkg_dir, "__main__.py")) else "main.py"
+        target = os.path.join(pkg_dir, entry_name or fallback)
+
     return {
         "command_name": resolved_name,
-        "publication": resolved_pub,
-        "release": rel,
-        "source_path": publication_dir,
-        "root": publication_dir,
+        "source_path": pkg_dir,
+        "root": pkg_dir,
         "target": target,
-        "bin_dir": os.path.abspath(target_bin_dir),
-        "bin_path": os.path.abspath(script_path),
+        "metadata": metadata,
     }
 
 
-def uninstall_target(command_name: str, bin_dir: str | None = None) -> dict:
-    target_bin_dir = bin_dir or _default_bin_dir()
-    candidates = [
-        os.path.join(target_bin_dir, command_name),
-        os.path.join(target_bin_dir, command_name + ".cmd"),
-        os.path.join(target_bin_dir, command_name + ".exe"),
-    ]
-    for candidate in candidates:
-        if os.path.exists(candidate):
-            try:
-                with open(candidate, "r", encoding="utf-8") as handle:
-                    content = handle.read(512)
-            except Exception:
-                content = ""
-            if "nitropkg-managed" not in content.lower() and "nitropkg-root" not in content.lower():
-                return {
-                    "command_name": command_name,
-                    "bin_dir": os.path.abspath(target_bin_dir),
-                    "removed": False,
-                    "path": os.path.abspath(candidate),
-                    "reason": "refusing to remove a non-nitropkg command",
-                }
-            os.remove(candidate)
+async def install_target(path: str, command_name: str | None = None, no_deps: bool = False) -> dict:
+    pkg_dir = os.path.abspath(path)
+    install_root = os.path.abspath(INTERNAL_WW_DIR)
+    try:
+        common_root = os.path.commonpath([install_root, pkg_dir])
+    except ValueError:
+        common_root = ""
+    if common_root != install_root:
+        raise ValueError(
+            "Only cached Wednesware publication directories may be installed via pipx. "
+            "Direct local package installs are disabled."
+        )
+
+    publication_dir_name = os.path.basename(pkg_dir)
+    parsed = _parse_installed_publication_dir(publication_dir_name)
+    if parsed is None:
+        raise ValueError(
+            "Only cached Wednesware publication directories may be installed via pipx. "
+            "Direct local package installs are disabled."
+        )
+
+    publication_name, release = parsed
+    return install_cached_publication(publication_name, release, command_name=command_name)
+
+
+def install_cached_publication(pub: str, rel: str = "latest", *, command_name: str | None = None, cache_root: str | None = None) -> dict:
+    publication_target = pub.strip().strip("/")
+    subpath: str | None = None
+    if "/" in publication_target:
+        publication_name, subpath = publication_target.split("/", 1)
+    else:
+        publication_name = publication_target
+
+    resolved_pub = parsepub(publication_name)
+    target_root = cache_root or INTERNAL_WW_DIR
+    publication_dir = os.path.join(target_root, _publication_leaf(resolved_pub, rel))
+    if not os.path.isdir(publication_dir):
+        raise FileNotFoundError(f"Publication '{resolved_pub}' release '{rel}' is not installed in the internal cache at '{publication_dir}'.")
+
+    entry_target = _resolve_cached_publication_entry(publication_dir, subpath)
+    relative_entry = os.path.relpath(entry_target, publication_dir).replace(os.sep, "/")
+    publication_command_name = command_name or resolved_pub.lower()
+    metadata = _infer_package_metadata(publication_dir, publication_command_name, entry=relative_entry)
+    metadata.pop("name", None)
+    metadata["command"] = publication_command_name
+    metadata["name"] = publication_command_name
+    result = _install_via_pipx(publication_dir, publication_command_name, metadata=metadata)
+    result["publication"] = resolved_pub
+    result["release"] = rel
+    result["entry_path"] = relative_entry
+    return result
+
+
+def uninstall_target(command_name: str) -> dict:
+    resolved_name = parsepub(command_name)
+    if shutil.which("pipx") is not None:
+        result = subprocess.run(["pipx", "uninstall", resolved_name], capture_output=True, text=True)
+        if result.returncode == 0:
             return {
-                "command_name": command_name,
-                "bin_dir": os.path.abspath(target_bin_dir),
+                "command_name": resolved_name,
                 "removed": True,
-                "path": os.path.abspath(candidate),
+                "path": None,
             }
-    return {
-        "command_name": command_name,
-        "bin_dir": os.path.abspath(target_bin_dir),
-        "removed": False,
-        "path": None,
-        "reason": "wrapper not found",
-    }
-
-
-
+    raise RuntimeError(f"pipx is not installed or the command '{resolved_name}' could not be removed.")
 
 @dataclass(slots=True)
 class InstallResult:
@@ -329,11 +393,10 @@ def _print_help() -> None:
     _print_section("General")
     _print_command("get <publication> [release]", "Download a Wednesware publication from GitHub.")
     _print_command("rm <publication> [release]", "Delete one release or all installed releases for a publication.")
-    _print_command("install <path> [--name <command>] [--bin <dir>] [--no-deps]", "Install a Nitrogen package from a local directory.")
-    _print_command("install-cache <publication> [release] [--name <command>] [--bin <dir>]", "Install a cached publication from the Nitrogen internal cache as a command.")
+    _print_command("install <publication> [release]", "Install a cached Wednesware publication via pipx.")
+    _print_command("uninstall <publication> [release]", "Uninstall a Nitrogen package by its publication name and optional release from the pipx cache.")
     _print_command("list", "List installed publications in Nitrogen's internal cache.")
     _print_command("cache", "Show the total cache size and per-publication cache usage.")
-    _print_command("uninstall <command> [--bin <dir>]", "Uninstall a Nitrogen package by its command name.")
     print()
     _print_section("Documentation")
     _print_command("readme", "Show the Nitrogen README.")
@@ -341,9 +404,15 @@ def _print_help() -> None:
     _print_command("help", "Show this help message.")
 
 def parsepub(pub: str) -> str:
-    if pub.lower() in PUBLICATION_CACHE:
-        return PUBLICATION_CACHE[pub.lower()]
-    return pub
+    value = (pub or "").strip()
+    if not value:
+        return value
+    lowered = value.lower()
+    if lowered in PUBLICATION_CACHE:
+        return PUBLICATION_CACHE[lowered]
+    if lowered in REVERSE_PUBLICATION_CACHE:
+        return lowered
+    return value
 
 def _publication_dirname(pub: str, rel: str, root: str = "ww") -> str:
     return os.path.join(root, _publication_leaf(pub, rel))
@@ -656,69 +725,34 @@ async def main() -> None:
             _print_status("hint", "Use `n2 rm all` to clear the cache or remove publications one by one with `n2 rm <publication>`.", "info")
         case "install":
             if len(sys.argv) == 2:
-                _print_status("help", "Usage: n2 install <path> [--name <command>] [--bin <dir>] [--no-deps]", "warning")
+                _print_status("help", "Usage: n2 install <publication> [release]", "warning")
                 sys.exit(1)
             args = sys.argv[2:]
-            path = args[0]
-            command_name = None
-            bin_dir = None
-            no_deps = False
-            for index in range(1, len(args)):
-                if args[index] == "--name" and index + 1 < len(args):
-                    command_name = args[index + 1]
-                elif args[index] == "--bin" and index + 1 < len(args):
-                    bin_dir = args[index + 1]
-                elif args[index] == "--no-deps":
-                    no_deps = True
+            target = args[0]
+            release = args[1] if len(args) > 1 and not args[1].startswith("--") else "latest"
             try:
-                result = await install_target(path, bin_dir=bin_dir, command_name=command_name, no_deps=no_deps)
-                _print_status("done", f"Installed command '{result['command_name']}'", "success")
-                _print_status("info", f"Target: {result['target']}", "info")
-                _print_status("info", f"Bin: {result['bin_path']}", "info")
-                _print_status("info", "You can run it directly from the shell now.", "info")
-                sys.exit(0)
-            except (FileNotFoundError, ValueError, RuntimeError) as exc:
-                _print_status("fail", str(exc), "error")
-                sys.exit(1)
-        case "install-cache":
-            if len(sys.argv) == 2:
-                _print_status("help", "Usage: n2 install-cache <publication> [release] [--name <command>] [--bin <dir>]", "warning")
-                sys.exit(1)
-            args = sys.argv[2:]
-            pub = args[0]
-            rel = args[1] if len(args) > 1 and not args[1].startswith("--") else "latest"
-            command_name = None
-            bin_dir = None
-            for index in range(1 if len(args) > 1 and args[1].startswith("--") else 2, len(args)):
-                if args[index] == "--name" and index + 1 < len(args):
-                    command_name = args[index + 1]
-                elif args[index] == "--bin" and index + 1 < len(args):
-                    bin_dir = args[index + 1]
-            try:
-                result = install_cached_publication(pub, rel, bin_dir=bin_dir, command_name=command_name)
-                _print_status("done", f"Installed cached command '{result['command_name']}'", "success")
-                _print_status("info", f"Target: {result['target']}", "info")
-                _print_status("info", f"Bin: {result['bin_path']}", "info")
-                _print_status("info", "You can run it directly from the shell now.", "info")
+                if os.path.isdir(target):
+                    raise ValueError(
+                        "Only cached Wednesware publication directories may be installed via pipx. "
+                        "Direct local package installs are disabled."
+                    )
+                result = install_cached_publication(target, release)
+                _print_status("done", f"Installed publication '{result['command_name']}' via pipx", "success")
+                _print_status("info", f"Source: {result['source_path']}", "info")
                 sys.exit(0)
             except (FileNotFoundError, ValueError, RuntimeError) as exc:
                 _print_status("fail", str(exc), "error")
                 sys.exit(1)
         case "uninstall":
             if len(sys.argv) == 2:
-                _print_status("help", "Usage: n2 uninstall <command> [--bin <dir>]", "warning")
+                _print_status("help", "Usage: n2 uninstall <publication>", "warning")
                 sys.exit(1)
-            args = sys.argv[2:]
-            command_name = args[0]
-            bin_dir = None
-            for index in range(1, len(args)):
-                if args[index] == "--bin" and index + 1 < len(args):
-                    bin_dir = args[index + 1]
-            result = uninstall_target(command_name, bin_dir=bin_dir)
+            command_name = parsepub(sys.argv[2])
+            result = uninstall_target(command_name)
             if result["removed"]:
-                _print_status("done", f"Removed command '{command_name}' from {result['bin_dir']}", "success")
+                _print_status("done", f"Removed command '{command_name}' from pipx", "success")
                 sys.exit(0)
-            _print_status("fail", result.get("reason", f"No Nitrogen-managed command '{command_name}' found."), "error")
+            _print_status("fail", f"No Nitrogen-managed command '{command_name}' found in pipx.", "error")
             sys.exit(1)
         case "readme":
             with open(os.path.join(os.path.dirname(__file__), "README.md")) as file:
