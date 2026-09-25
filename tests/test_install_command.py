@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import pathlib
 import subprocess
 import tempfile
 import urllib.error
@@ -81,11 +82,26 @@ def test_uninstall_target_resolves_publication_aliases(monkeypatch):
 def test_load_nitropkg_removes_name_field(tmp_path):
     pkg_dir = tmp_path / "demo-pkg"
     pkg_dir.mkdir()
-    (pkg_dir / ".nitropkg").write_text(json.dumps({"name": "legacy-name", "entry": "main.py"}), encoding="utf-8")
+    (pkg_dir / ".nitropkg").write_text(json.dumps({"name": "legacy-name", "entry": "main.py", "dependencies": ["requests>=2"]}), encoding="utf-8")
 
     metadata = nitrogen._load_nitropkg(str(pkg_dir))
 
-    assert metadata == {"entry": "main.py"}
+    assert metadata == {"entry": "main.py", "dependencies": ["requests>=2"]}
+
+
+def test_write_pyproject_toml_includes_dependencies(tmp_path):
+    pkg_dir = tmp_path / "demo-pkg"
+    pkg_dir.mkdir()
+    (pkg_dir / "main.py").write_text("print('hello')\n", encoding="utf-8")
+
+    pyproject_path = nitrogen._write_pyproject_toml(
+        str(pkg_dir),
+        "demo-app",
+        {"entry": "main.py", "dependencies": ["requests>=2", "httpx>=0.28"]},
+    )
+
+    pyproject = pyproject_path and pathlib.Path(pyproject_path).read_text(encoding="utf-8")
+    assert 'dependencies = ["requests>=2", "httpx>=0.28"]' in pyproject
 
 
 def test_install_cached_publication_ignores_nitropkg_name_and_uses_publication_name(tmp_path, monkeypatch):

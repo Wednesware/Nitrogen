@@ -35,15 +35,15 @@ Delete one release or all installed releases for a publication. If no release is
 
 ### `install <publication> [release]`
 
-Install a cached Wednesware publication via `pipx`. Local package directories are not supported; use `pipx` for publication installs only.
+Install a cached Wednesware publication via `pipx`.
 
 > `n2 install b 26.5`
 
 ### `uninstall <publication> [release]`
 
-Uninstall a Nitrogen package by its publication name and optional release from the `pipx` cache.
+Uninstall a publication via `pipx`.
 
-> `n2 uninstall magnesium 26.5x`
+> `n2 uninstall magnesium 26.5`
 
 ### `list`
 
@@ -56,7 +56,6 @@ List installed publications in Nitrogen's internal cache.
 Show the total cache size and per-publication cache usage for the internal cache directory.
 
 > `n2 cache`
-
 
 ## Documentation
 

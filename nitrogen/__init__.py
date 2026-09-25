@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from urllib.request import urlretrieve
 
 
-VERSION: str = "26.62"
+VERSION: str = "26.63"
 
 
 class NitrogenDependencyError(RuntimeError):
@@ -139,6 +139,17 @@ def _sanitize_python_name(value: str) -> str:
     return sanitized or "nitrogen-app"
 
 
+def _toml_list(values: object) -> str:
+    if values is None:
+        return "[]"
+    if isinstance(values, str):
+        values = [values]
+    normalized = [str(item).strip() for item in values if str(item).strip()]
+    if not normalized:
+        return "[]"
+    return ", ".join(json.dumps(item) for item in normalized)
+
+
 def _build_entry_wrapper(entry: str, pkg_dir: str) -> str:
     entry_value = entry.replace("\\", "/")
     pkg_root = os.path.abspath(pkg_dir)
@@ -225,6 +236,8 @@ def _write_pyproject_toml(pkg_dir: str, cmd_name: str, metadata: dict | None = N
     package_dir = os.path.abspath(pkg_dir)
     projected_root = os.path.basename(package_dir) or "nitrogen-app"
     projected_name = _sanitize_python_name(projected_root)
+    dependency_entries = metadata.get("dependencies") or []
+    dependencies_line = f"dependencies = [{_toml_list(dependency_entries)}]\n" if dependency_entries else ""
     wrapper_path = os.path.join(package_dir, "nitrogen_entry.py")
     with open(wrapper_path, "w", encoding="utf-8") as handle:
         handle.write(_build_entry_wrapper(entry, package_dir))
@@ -239,8 +252,9 @@ def _write_pyproject_toml(pkg_dir: str, cmd_name: str, metadata: dict | None = N
             f"name = \"{_sanitize_python_name(pkg_name)}\"\n"
             f"version = \"{metadata.get('version', '0.1.0')}\"\n"
             f"description = \"{metadata.get('description', metadata.get('name', projected_name))}\"\n"
-            f"requires-python = \"{metadata.get('requires-python', '>=3.12')}\"\n\n"
-            "[project.scripts]\n"
+            f"requires-python = \"{metadata.get('requires-python', '>=3.12')}\"\n"
+            + (dependencies_line + "\n" if dependencies_line else "") +
+            "\n[project.scripts]\n"
             f"{cmd_name or pkg_name} = \"nitrogen_entry:main\"\n\n"
             "[tool.setuptools]\n"
             "py-modules = [\"nitrogen_entry\"]\n"
