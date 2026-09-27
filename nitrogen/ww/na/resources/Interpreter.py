@@ -1,4 +1,10 @@
+import os
 from pathlib import Path
+
+_TRIGGER_REGISTRY: dict[str, list[dict]] = {}
+_TRIGGER_DISCOVERY_DONE = False
+_TRIGGER_SCAN_LIMIT = 2000
+_MODULE_CACHE: dict[str, dict] = {}
 
 
 class Interpreter:
@@ -10,6 +16,7 @@ class Interpreter:
         self.filename = "<source>"
         self.error_position = 0
         self.error_end = 1
+        self.module_cache = _MODULE_CACHE
 
     def run(self, tokens: list[list[dict]], content: str = "", filename: str = "<source>"):
         self.content = content
@@ -51,6 +58,8 @@ class Interpreter:
             "set": self._builtin_set,
             "bytes": self._builtin_bytes,
             "import": self._builtin_import,
+            "on": self._builtin_on,
+            "trigger": self._builtin_trigger,
             "null": None,
             "function": {"kind": "function", "name": "function", "params": [], "body": [], "scope": []},
             "class": {"kind": "class", "name": "class", "methods": {}},
@@ -106,6 +115,163 @@ class Interpreter:
     def _builtin_print(self, *values):
         print(*[self._fmt_value(value) for value in values])
         return None
+
+    def _builtin_on(self, *args):
+        if not args:
+            self.fail(None, "on requires a trigger name", TypeError)
+        trigger_name = args[0]
+        if not isinstance(trigger_name, str):
+            self.fail(None, "trigger name must be a string", TypeError)
+        params = []
+        defaults = {}
+        for index, value in enumerate(args[1:], start=1):
+            if isinstance(value, dict) and "__trigger_param__" in value:
+                params.append(value["__trigger_param__"])
+                defaults[value["__trigger_param__"]] = value.get("__trigger_default__")
+                continue
+            params.append(str(value))
+        handler = {
+            "kind": "function",
+            "name": None,
+            "params": params,
+            "body": [],
+            "scope": list(self.scopes),
+            "defaults": defaults,
+            "__trigger__": trigger_name,
+        }
+        self.register_trigger(trigger_name, handler)
+        return handler
+
+    def _builtin_trigger(self, trigger_name, *args):
+        if not isinstance(trigger_name, str):
+            self.fail(None, "trigger name must be a string", TypeError)
+        self.discover_triggers()
+        handlers = list(self.trigger_registry().get(trigger_name, []))
+        results = []
+        for handler in handlers:
+            if isinstance(handler, dict) and handler.get("kind") == "function":
+                results.append(self.invoke_function(handler, list(args), None))
+            elif callable(handler):
+                results.append(handler(*args))
+            else:
+                results.append(handler)
+        return results
+
+    def trigger_registry(self) -> dict[str, list[dict]]:
+        return _TRIGGER_REGISTRY
+
+    def register_trigger(self, trigger_name: str, handler: dict):
+        if not isinstance(trigger_name, str):
+            self.fail(None, "trigger name must be a string", TypeError)
+        registry = self.trigger_registry()
+        registry.setdefault(trigger_name, [])
+        handler.setdefault("name", f"on:{trigger_name}")
+        handler["__trigger__"] = trigger_name
+        registry[trigger_name].append(handler)
+        return handler
+
+    def discover_triggers(self):
+        global _TRIGGER_DISCOVERY_DONE
+        if _TRIGGER_DISCOVERY_DONE:
+            return
+
+        roots: list[Path] = []
+        cwd = Path.cwd().resolve()
+        roots.append(cwd)
+        current_file = Path(self.filename).resolve() if self.filename not in {"<source>", "", None} else None
+        if current_file is not None:
+            roots.append(current_file.parent)
+
+        seen: set[Path] = set()
+        for root in roots:
+            if root in seen or not root.exists() or not root.is_dir():
+                continue
+            seen.add(root)
+            self._scan_trigger_root(root)
+
+        _TRIGGER_DISCOVERY_DONE = True
+
+    def _scan_trigger_root(self, root: Path):
+        if not root.is_dir():
+            return
+        count = 0
+        for current, _, files in os.walk(root):
+            count += len(files)
+            if count > _TRIGGER_SCAN_LIMIT:
+                return
+            for name in files:
+                if not name.endswith(".na"):
+                    continue
+                path = Path(current) / name
+                if not path.is_file():
+                    continue
+                self._register_trigger_file(path)
+
+    def _register_trigger_file(self, path: Path):
+        try:
+            source = path.read_text()
+        except OSError:
+            return
+        tokenizer = self.sodium.res.Tokenizer(self.sodium, self.options)
+        try:
+            tokens = tokenizer.run(source)
+        except (SyntaxError, ValueError):
+            return
+
+        for line in tokens:
+            for token in line:
+                self._collect_trigger_handlers(token)
+
+    def _collect_trigger_handlers(self, token: dict):
+        if not isinstance(token, dict):
+            return
+        if token.get("type") == "handler":
+            target, *body = token.get("children", [])
+            if isinstance(target, dict) and target.get("type") == "call":
+                call_target = target.get("children", [None])[0]
+                if isinstance(call_target, dict) and call_target.get("type") == "identifier" and call_target.get("value") == "on":
+                    trigger_name, params, defaults = self._parse_trigger_registration(target)
+                    if trigger_name is None:
+                        return
+                    handler = {
+                        "kind": "function",
+                        "name": None,
+                        "params": params,
+                        "body": body,
+                        "scope": list(self.scopes),
+                        "defaults": defaults,
+                        "__trigger__": trigger_name,
+                    }
+                    self.register_trigger(trigger_name, handler)
+        for child in token.get("children", []):
+            if isinstance(child, dict):
+                self._collect_trigger_handlers(child)
+
+    def _parse_trigger_registration(self, target: dict):
+        if not isinstance(target, dict) or target.get("type") != "call":
+            return None, [], {}
+        children = target.get("children", [])
+        if len(children) < 2:
+            return None, [], {}
+        trigger_name = self.value(children[1])
+        if not isinstance(trigger_name, str):
+            self.fail(children[1], "trigger name must be a string", TypeError)
+        params: list[str] = []
+        defaults: dict[str, object] = {}
+        for argument in children[2:]:
+            if not isinstance(argument, dict):
+                continue
+            if argument.get("type") == "assignment":
+                left = argument.get("children", [None, None])[0]
+                right = argument.get("children", [None, None])[1]
+                if isinstance(left, dict) and left.get("type") == "identifier":
+                    name = left.get("value")
+                    params.append(name)
+                    defaults[name] = self.value(right)
+                continue
+            if argument.get("type") == "identifier":
+                params.append(argument.get("value"))
+        return trigger_name, params, defaults
 
     def _builtin_input(self, *values):
         prompt = "".join(str(value) for value in values)
@@ -164,6 +330,14 @@ class Interpreter:
             path = (base_dir / f"{name}.na")
         if not path.exists():
             raise ImportError(f"cannot import {name!r}: module not found")
+
+        resolved_path = str(path.resolve())
+        cached = self.module_cache.get(resolved_path)
+        if isinstance(cached, dict):
+            if self.scopes:
+                self.scopes[-1].update(cached)
+            return cached
+
         source = path.read_text()
         tokenizer = self.sodium.res.Tokenizer(self.sodium, self.options)
         previous_filename = self.filename
@@ -179,6 +353,7 @@ class Interpreter:
                 module_result = module_result[1]
             imported = module_interpreter.scopes[-1]
             if isinstance(imported, dict):
+                self.module_cache[resolved_path] = imported
                 self.scopes[-1].update(imported)
             return imported
         finally:
@@ -213,11 +388,23 @@ class Interpreter:
         if kind == "map":
             result = {}
             for pair in children:
-                key = self.value(pair["children"][0])
+                key_token = pair["children"][0]
+                if isinstance(key_token, dict) and key_token.get("type") == "identifier":
+                    key = key_token["value"]
+                else:
+                    key = self.value(key_token)
                 result[key] = self.value(pair["children"][1])
             return result
         if kind == "custom":
-            return {self.value(pair["children"][0]): self.value(pair["children"][1]) for pair in children}
+            result = {}
+            for pair in children:
+                key_token = pair["children"][0]
+                if isinstance(key_token, dict) and key_token.get("type") == "identifier":
+                    key = key_token["value"]
+                else:
+                    key = self.value(key_token)
+                result[key] = self.value(pair["children"][1])
+            return result
         if kind == "member":
             return self.member(self.value(children[0]), value, token)
         if kind == "index":
@@ -413,6 +600,10 @@ class Interpreter:
 
     def call(self, token: dict):
         callee, *arguments = token["children"]
+        callee_name = callee.get("value") if isinstance(callee, dict) and callee.get("type") == "identifier" else None
+        if callee_name == "on":
+            return self._register_on_handler(arguments, token)
+
         target = self.value(callee)
         args = [self.value(arg) for arg in arguments]
 
@@ -434,15 +625,64 @@ class Interpreter:
                 self.fail(token, str(error), type(error))
         self.fail(callee, "value is not callable", TypeError)
 
+    def _register_on_handler(self, arguments: list[dict], token: dict):
+        if not arguments:
+            self.fail(token, "on requires a trigger name", TypeError)
+
+        trigger_name = self.value(arguments[0])
+        if not isinstance(trigger_name, str):
+            self.fail(arguments[0], "trigger name must be a string", TypeError)
+
+        params: list[str] = []
+        defaults: dict[str, object] = {}
+        for argument in arguments[1:]:
+            if isinstance(argument, dict) and argument.get("type") == "assignment":
+                left = argument.get("children", [None, None])[0]
+                right = argument.get("children", [None, None])[1]
+                if not isinstance(left, dict) or left.get("type") != "identifier":
+                    self.fail(argument, "on parameters must be identifiers", SyntaxError)
+                name = left.get("value")
+                if not isinstance(name, str):
+                    self.fail(left, "on parameters must be named", SyntaxError)
+                params.append(name)
+                defaults[name] = self.value(right)
+                continue
+            if isinstance(argument, dict) and argument.get("type") == "identifier":
+                params.append(argument.get("value"))
+                continue
+            self.fail(argument, "unsupported on() parameter", SyntaxError)
+
+        return {
+            "kind": "function",
+            "name": None,
+            "params": params,
+            "body": [],
+            "scope": list(self.scopes),
+            "defaults": defaults,
+            "__trigger__": trigger_name,
+        }
+
     def invoke_function(self, func: dict, args: list, token: dict):
         params = list(func.get("params", []))
         body = list(func.get("body", []))
+        defaults = dict(func.get("defaults", {}))
         if not body and not params and not args:
             return {"kind": "function", "params": [], "body": [], "scope": list(self.scopes)}
-        if len(args) != len(params):
+
+        if len(args) > len(params):
+            self.fail(token, f"expected at most {len(params)} arguments, got {len(args)}", TypeError)
+
+        bound_args = list(args)
+        for index in range(len(params)):
+            if index < len(bound_args):
+                continue
+            if params[index] in defaults:
+                bound_args.append(defaults[params[index]])
+                continue
             self.fail(token, f"expected {len(params)} arguments, got {len(args)}", TypeError)
+
         previous = self.scopes
-        self.scopes = list(func.get("scope", self.scopes)) + [dict(zip(params, args))]
+        self.scopes = list(func.get("scope", self.scopes)) + [dict(zip(params, bound_args))]
         try:
             result = self.lines(body)
             if isinstance(result, tuple) and result[0] == "return":
@@ -502,6 +742,12 @@ class Interpreter:
         if isinstance(value, dict) and value.get("kind") == "function":
             value["body"] = body
             value["scope"] = list(self.scopes)
+            return value
+
+        if isinstance(value, dict) and value.get("kind") == "function" and isinstance(value.get("__trigger__"), str):
+            value["body"] = body
+            value["scope"] = list(self.scopes)
+            self.register_trigger(value["__trigger__"], value)
             return value
 
         if isinstance(value, dict) and value.get("kind") == "class":

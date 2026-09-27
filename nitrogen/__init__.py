@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from urllib.request import urlretrieve
 
 
-VERSION: str = "26.64"
+VERSION: str = "26.65"
 
 
 class NitrogenDependencyError(RuntimeError):
@@ -74,7 +74,7 @@ INTERNAL_TEMP_DIR: str = os.path.join(os.path.dirname(__file__), "temp")
 running_installs: dict[tuple[str, str, str], asyncio.Task] = {}
 
 
-def _load_nitropkg(path: str) -> dict:
+def _read_raw_nitropkg(path: str) -> dict:
     pkg_dir = os.path.abspath(path)
     if not os.path.isdir(pkg_dir):
         raise ValueError(f"Only directories can be installed: {path}")
@@ -88,8 +88,14 @@ def _load_nitropkg(path: str) -> dict:
         raise ValueError(f".nitropkg is not valid JSON: {pkg_file}") from exc
     if not isinstance(metadata, dict):
         raise ValueError(f".nitropkg must contain a JSON object: {pkg_file}")
-    metadata = dict(metadata)
+    return dict(metadata)
+
+
+def _load_nitropkg(path: str) -> dict:
+    metadata = _read_raw_nitropkg(path)
     metadata.pop("dependency", None)
+    metadata.pop("name", None)
+    metadata.pop("command", None)
     return metadata
 
 
@@ -303,7 +309,38 @@ def _install_via_pipx(pkg_dir: str, command_name: str | None = None, metadata: d
     env = os.environ.copy()
     try:
         subprocess.run(["pipx", "uninstall", resolved_name], capture_output=True, text=True, env=env, check=False)
-        subprocess.run(["pipx", "install", pkg_dir, "--force"], check=True, capture_output=True, text=True, env=env)
+        install_result = subprocess.run(["pipx", "install", pkg_dir, "--force"], capture_output=True, text=True, env=env, check=False)
+        if install_result.returncode != 0:
+            output = (install_result.stderr or install_result.stdout or "").strip()
+            lowered = output.lower()
+            if any(token in lowered for token in ("already installed", "already exists", "already installed in pipx", "use 'pipx reinstall")):
+                reinstall_result = subprocess.run(["pipx", "reinstall", resolved_name], capture_output=True, text=True, env=env, check=False)
+                if reinstall_result.returncode != 0:
+                    reinstall_output = (reinstall_result.stderr or reinstall_result.stdout or "").strip()
+                    lowered = reinstall_output.lower()
+                    if "nothing to reinstall" in lowered or "not installed" in lowered or "no app" in lowered:
+                        return {
+                            "command_name": resolved_name,
+                            "source_path": pkg_dir,
+                            "root": pkg_dir,
+                            "target": os.path.join(pkg_dir, metadata.get("entry") or "__main__.py"),
+                            "metadata": metadata,
+                        }
+                    if not reinstall_output:
+                        reinstall_output = f"pipx exited with status {reinstall_result.returncode} while reinstalling '{resolved_name}'."
+                    raise RuntimeError(
+                        f"Could not reinstall '{resolved_name}' via pipx. pipx reported: {reinstall_output}"
+                    )
+                return {
+                    "command_name": resolved_name,
+                    "source_path": pkg_dir,
+                    "root": pkg_dir,
+                    "target": os.path.join(pkg_dir, metadata.get("entry") or "__main__.py"),
+                    "metadata": metadata,
+                }
+            if not output:
+                output = f"pipx exited with status {install_result.returncode} while installing '{resolved_name}'."
+            raise RuntimeError(f"Could not install '{resolved_name}' via pipx. pipx reported: {output}")
     finally:
         for cleanup_path in (pyproject_path, os.path.join(pkg_dir, "nitrogen_entry.py")):
             if os.path.exists(cleanup_path):
@@ -366,8 +403,9 @@ def install_cached_publication(pub: str, rel: str = "latest", *, command_name: s
 
     entry_target = _resolve_cached_publication_entry(publication_dir, subpath)
     relative_entry = os.path.relpath(entry_target, publication_dir).replace(os.sep, "/")
+    raw_nitropkg = _read_raw_nitropkg(publication_dir) if os.path.isfile(os.path.join(publication_dir, ".nitropkg")) else {}
     nitropkg_metadata = _load_nitropkg(publication_dir) if os.path.isfile(os.path.join(publication_dir, ".nitropkg")) else {}
-    publication_command_name = command_name or nitropkg_metadata.get("command") or nitropkg_metadata.get("name") or resolved_pub.lower()
+    publication_command_name = command_name or raw_nitropkg.get("command") or raw_nitropkg.get("name") or nitropkg_metadata.get("command") or nitropkg_metadata.get("name") or resolved_pub.lower()
     metadata = _infer_package_metadata(publication_dir, publication_command_name, entry=relative_entry)
     metadata.update(nitropkg_metadata)
     metadata["command"] = publication_command_name
@@ -798,7 +836,7 @@ async def main() -> None:
                 _print_status("done", f"Installed publication '{result['command_name']}' via pipx", "success")
                 _print_status("info", f"Source: {result['source_path']}", "info")
                 sys.exit(0)
-            except (FileNotFoundError, ValueError, RuntimeError) as exc:
+            except (FileNotFoundError, ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
                 _print_status("fail", str(exc), "error")
                 sys.exit(1)
         case "uninstall":

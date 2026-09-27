@@ -142,6 +142,39 @@ def test_install_cached_publication_declares_nitrogen_runtime_dependency(tmp_pat
     assert calls[1] == ["pipx", "install", str(pub_dir), "--force"]
 
 
+def test_install_via_pipx_reinstalls_when_already_installed(tmp_path, monkeypatch):
+    pkg_dir = tmp_path / "demo-app"
+    pkg_dir.mkdir()
+    (pkg_dir / "__main__.py").write_text("print('hello')\n", encoding="utf-8")
+
+    calls = []
+
+    def fake_which(name):
+        return "/usr/bin/pipx" if name == "pipx" else None
+
+    def fake_run(cmd, capture_output, text, check=False, env=None):
+        calls.append(cmd)
+        if cmd[0:2] == ["pipx", "uninstall"]:
+            return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        if cmd[0:2] == ["pipx", "install"]:
+            return type(
+                "Result",
+                (),
+                {"returncode": 1, "stdout": "", "stderr": "The package 'sodium' is already installed. Use 'pipx reinstall sodium'."},
+            )()
+        if cmd[0:2] == ["pipx", "reinstall"]:
+            return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        raise AssertionError(f"Unexpected pipx command: {cmd}")
+
+    monkeypatch.setattr(nitrogen.shutil, "which", fake_which)
+    monkeypatch.setattr(nitrogen.subprocess, "run", fake_run)
+
+    result = nitrogen._install_via_pipx(str(pkg_dir), "sodium", metadata={"entry": "__main__.py"})
+
+    assert result["command_name"] == "sodium"
+    assert ["pipx", "reinstall", "sodium"] in calls
+
+
 def test_install_cached_publication_uses_nitropkg_name_as_command_name_when_present(tmp_path, monkeypatch):
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
