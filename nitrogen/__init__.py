@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from urllib.request import urlretrieve
 
 
-VERSION: str = "26.63"
+VERSION: str = "26.64"
 
 
 class NitrogenDependencyError(RuntimeError):
@@ -73,6 +73,7 @@ INTERNAL_TEMP_DIR: str = os.path.join(os.path.dirname(__file__), "temp")
 
 running_installs: dict[tuple[str, str, str], asyncio.Task] = {}
 
+
 def _load_nitropkg(path: str) -> dict:
     pkg_dir = os.path.abspath(path)
     if not os.path.isdir(pkg_dir):
@@ -88,7 +89,7 @@ def _load_nitropkg(path: str) -> dict:
     if not isinstance(metadata, dict):
         raise ValueError(f".nitropkg must contain a JSON object: {pkg_file}")
     metadata = dict(metadata)
-    metadata.pop("name", None)
+    metadata.pop("dependency", None)
     return metadata
 
 
@@ -148,6 +149,29 @@ def _toml_list(values: object) -> str:
     if not normalized:
         return "[]"
     return ", ".join(json.dumps(item) for item in normalized)
+
+
+def _dependency_list(values: object | None, *, include_nitrogen: bool = False) -> list[str]:
+    if values is None:
+        values = []
+    if isinstance(values, str):
+        values = [values]
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        candidate = str(item).strip()
+        if not candidate:
+            continue
+        key = candidate.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(candidate)
+    if include_nitrogen:
+        nitro_key = "wwn"
+        if not any(item.lower() == nitro_key for item in normalized):
+            normalized.insert(0, nitro_key)
+    return normalized
 
 
 def _build_entry_wrapper(entry: str, pkg_dir: str) -> str:
@@ -228,8 +252,9 @@ def _resolve_cached_publication_entry(publication_dir: str, subpath: str | None 
 
 
 def _write_pyproject_toml(pkg_dir: str, cmd_name: str, metadata: dict | None = None) -> str:
-    metadata = metadata or _infer_package_metadata(pkg_dir, cmd_name)
-    pkg_name = _sanitize_python_name(cmd_name or metadata.get("name") or metadata.get("command") or os.path.basename(pkg_dir))
+    metadata = dict(metadata or _infer_package_metadata(pkg_dir, cmd_name))
+    package_name = metadata.get("package_name") or metadata.get("publication") or metadata.get("name") or cmd_name or os.path.basename(pkg_dir)
+    project_name = _sanitize_python_name(package_name)
     entry = metadata.get("entry") or metadata.get("main") or metadata.get("script") or next((candidate for candidate in ("__main__.py", "main.py", "app.py", "run.py") if os.path.isfile(os.path.join(pkg_dir, candidate))), None)
     if entry is None:
         raise ValueError(f"No valid entry script found in package directory '{pkg_dir}'")
@@ -249,13 +274,13 @@ def _write_pyproject_toml(pkg_dir: str, cmd_name: str, metadata: dict | None = N
             "requires = [\"setuptools>=68\"]\n"
             "build-backend = \"setuptools.build_meta\"\n\n"
             "[project]\n"
-            f"name = \"{_sanitize_python_name(pkg_name)}\"\n"
+            f"name = \"{project_name}\"\n"
             f"version = \"{metadata.get('version', '0.1.0')}\"\n"
             f"description = \"{metadata.get('description', metadata.get('name', projected_name))}\"\n"
             f"requires-python = \"{metadata.get('requires-python', '>=3.12')}\"\n"
             + (dependencies_line + "\n" if dependencies_line else "") +
             "\n[project.scripts]\n"
-            f"{cmd_name or pkg_name} = \"nitrogen_entry:main\"\n\n"
+            f"{cmd_name} = \"nitrogen_entry:main\"\n\n"
             "[tool.setuptools]\n"
             "py-modules = [\"nitrogen_entry\"]\n"
         )
@@ -270,7 +295,6 @@ def _install_via_pipx(pkg_dir: str, command_name: str | None = None, metadata: d
         metadata = _load_nitropkg(pkg_dir) if os.path.isfile(os.path.join(pkg_dir, ".nitropkg")) else _infer_package_metadata(pkg_dir, command_name)
     else:
         metadata = dict(metadata)
-        metadata.pop("name", None)
 
     resolved_name = command_name or metadata.get("command") or metadata.get("name") or os.path.basename(pkg_dir)
     metadata["command"] = resolved_name
@@ -342,11 +366,15 @@ def install_cached_publication(pub: str, rel: str = "latest", *, command_name: s
 
     entry_target = _resolve_cached_publication_entry(publication_dir, subpath)
     relative_entry = os.path.relpath(entry_target, publication_dir).replace(os.sep, "/")
-    publication_command_name = command_name or resolved_pub.lower()
+    nitropkg_metadata = _load_nitropkg(publication_dir) if os.path.isfile(os.path.join(publication_dir, ".nitropkg")) else {}
+    publication_command_name = command_name or nitropkg_metadata.get("command") or nitropkg_metadata.get("name") or resolved_pub.lower()
     metadata = _infer_package_metadata(publication_dir, publication_command_name, entry=relative_entry)
-    metadata.pop("name", None)
+    metadata.update(nitropkg_metadata)
     metadata["command"] = publication_command_name
     metadata["name"] = publication_command_name
+    metadata["package_name"] = resolved_pub.lower()
+    metadata["publication"] = resolved_pub
+    metadata["dependencies"] = _dependency_list(metadata.get("dependencies"), include_nitrogen=True)
     result = _install_via_pipx(publication_dir, publication_command_name, metadata=metadata)
     result["publication"] = resolved_pub
     result["release"] = rel
@@ -355,16 +383,26 @@ def install_cached_publication(pub: str, rel: str = "latest", *, command_name: s
 
 
 def uninstall_target(command_name: str) -> dict:
-    resolved_name = parsepub(command_name)
-    if shutil.which("pipx") is not None:
-        result = subprocess.run(["pipx", "uninstall", resolved_name], capture_output=True, text=True)
-        if result.returncode == 0:
-            return {
-                "command_name": resolved_name,
-                "removed": True,
-                "path": None,
-            }
-    raise RuntimeError(f"pipx is not installed or the command '{resolved_name}' could not be removed.")
+    requested_name = (command_name or "").strip()
+    package_name = parsepub(requested_name)
+    if shutil.which("pipx") is None:
+        raise RuntimeError("pipx is not installed or not on PATH.")
+
+    result = subprocess.run(["pipx", "uninstall", package_name], capture_output=True, text=True)
+    if result.returncode == 0:
+        return {
+            "command_name": requested_name,
+            "package_name": package_name,
+            "removed": True,
+            "path": None,
+        }
+
+    output = (result.stderr or result.stdout or "").strip()
+    if not output:
+        output = f"The package '{package_name}' is not installed or could not be removed."
+    if any(token in output.lower() for token in ("not installed", "not found", "no app")):
+        raise RuntimeError(f"The command '{requested_name}' is not installed in pipx, so there was nothing to remove.")
+    raise RuntimeError(f"The package '{package_name}' could not be removed. pipx reported: {output}")
 
 @dataclass(slots=True)
 class InstallResult:
@@ -710,6 +748,9 @@ async def main() -> None:
             else:
                 _print_status("miss", f"Could not find publication '{pub.capitalize()}'. Are you sure you spelled it right?", "warning")
         case "list":
+            if not os.path.isdir(INTERNAL_WW_DIR):
+                _print_status("miss", f"Cache directory '{INTERNAL_WW_DIR}' does not exist. No publications are installed.", "warning")
+                sys.exit(1)
             _print_status("info", "Installed publications:", "info")
             for entry in os.listdir(INTERNAL_WW_DIR):
                 if entry == "temp":
@@ -719,6 +760,9 @@ async def main() -> None:
                     name_split: list[str] = re.match(r'([A-Za-z]*)(.*)', entry).groups()
                     _print_status("info", f"{PUBLICATION_CACHE.get(name_split[0], 'unknown').capitalize()}{' ' + name_split[1].replace('_', '.') if name_split[1] else ''} ({entry}) at {entry_path}", "info")
         case "cache":
+            if not os.path.isdir(INTERNAL_WW_DIR):
+                _print_status("miss", f"Cache directory '{INTERNAL_WW_DIR}' does not exist yet. There are no cached publications to inspect.", "warning")
+                sys.exit(1)
             _print_status("hint", "Trying to list publications in the cache? Use `n2 list` instead.", "info")
             def human_size(size: float) -> str:
                 for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
@@ -761,13 +805,14 @@ async def main() -> None:
             if len(sys.argv) == 2:
                 _print_status("help", "Usage: n2 uninstall <publication>", "warning")
                 sys.exit(1)
-            command_name = parsepub(sys.argv[2])
-            result = uninstall_target(command_name)
-            if result["removed"]:
-                _print_status("done", f"Removed command '{command_name}' from pipx", "success")
-                sys.exit(0)
-            _print_status("fail", f"No Nitrogen-managed command '{command_name}' found in pipx.", "error")
-            sys.exit(1)
+            command_name = sys.argv[2]
+            try:
+                result = uninstall_target(command_name)
+            except RuntimeError as exc:
+                _print_status("fail", str(exc), "error")
+                sys.exit(1)
+            _print_status("done", f"Removed package '{result['package_name']}' and command '{command_name}' from pipx", "success")
+            sys.exit(0)
         case "readme":
             with open(os.path.join(os.path.dirname(__file__), "README.md")) as file:
                 print(file.read())

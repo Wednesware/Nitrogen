@@ -1,0 +1,6 @@
+{
+    "name": "na",
+    "version": "26.1",
+    "author": "Wednesware",
+    "dependencies": ["wwn"]
+}

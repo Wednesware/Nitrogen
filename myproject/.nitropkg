@@ -2,5 +2,6 @@
   "name": "myproject",
   "version": "1.0.0",
   "author": "Wednesware",
-  "entry": "__main__.py"
+  "entry": "__main__.py",
+  "dependencies": []
 }

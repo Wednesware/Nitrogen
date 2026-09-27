@@ -3,10 +3,10 @@ import os
 import runpy
 import sys
 
-ROOT = '/home/danny/projects/wednesware/nitrogen/nitrogen/ww/b'
+ROOT = '/home/danny/projects/wednesware/nitrogen/nitrogen/ww/na'
 ENTRY = '__main__.py'
-PACKAGE_NAME = 'b'
-MODULE_PATH = '/home/danny/projects/wednesware/nitrogen/nitrogen/ww/b/__main__.py'
+PACKAGE_NAME = 'na'
+MODULE_PATH = '/home/danny/projects/wednesware/nitrogen/nitrogen/ww/na/__main__.py'
 
 
 def main() -> None:

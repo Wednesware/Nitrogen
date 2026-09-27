@@ -1,8 +1,0 @@
-LICENSE.md
-nitrogen_entry.py
-pyproject.toml
-boron.egg-info/PKG-INFO
-boron.egg-info/SOURCES.txt
-boron.egg-info/dependency_links.txt
-boron.egg-info/entry_points.txt
-boron.egg-info/top_level.txt

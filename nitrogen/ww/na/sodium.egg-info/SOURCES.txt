@@ -1,0 +1,9 @@
+LICENSE.md
+nitrogen_entry.py
+pyproject.toml
+sodium.egg-info/PKG-INFO
+sodium.egg-info/SOURCES.txt
+sodium.egg-info/dependency_links.txt
+sodium.egg-info/entry_points.txt
+sodium.egg-info/requires.txt
+sodium.egg-info/top_level.txt

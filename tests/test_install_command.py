@@ -89,6 +89,16 @@ def test_load_nitropkg_removes_name_field(tmp_path):
     assert metadata == {"entry": "main.py", "dependencies": ["requests>=2"]}
 
 
+def test_load_nitropkg_ignores_dependency_alias(tmp_path):
+    pkg_dir = tmp_path / "demo-pkg"
+    pkg_dir.mkdir()
+    (pkg_dir / ".nitropkg").write_text(json.dumps({"name": "legacy-name", "entry": "main.py", "dependency": ["requests>=2"]}), encoding="utf-8")
+
+    metadata = nitrogen._load_nitropkg(str(pkg_dir))
+
+    assert metadata == {"entry": "main.py"}
+
+
 def test_write_pyproject_toml_includes_dependencies(tmp_path):
     pkg_dir = tmp_path / "demo-pkg"
     pkg_dir.mkdir()
@@ -104,7 +114,35 @@ def test_write_pyproject_toml_includes_dependencies(tmp_path):
     assert 'dependencies = ["requests>=2", "httpx>=0.28"]' in pyproject
 
 
-def test_install_cached_publication_ignores_nitropkg_name_and_uses_publication_name(tmp_path, monkeypatch):
+def test_install_cached_publication_declares_nitrogen_runtime_dependency(tmp_path, monkeypatch):
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    pub_dir = cache_dir / "na26_1"
+    pub_dir.mkdir()
+    (pub_dir / "__main__.py").write_text("print('cached sodium run')\n", encoding="utf-8")
+
+    monkeypatch.setattr(nitrogen, "INTERNAL_WW_DIR", str(cache_dir))
+
+    calls = []
+
+    def fake_which(name):
+        return "/usr/bin/pipx" if name == "pipx" else None
+
+    def fake_run(cmd, capture_output, text, check=False, env=None):
+        calls.append(cmd)
+        return type("Result", (), {"returncode": 0})()
+
+    monkeypatch.setattr(nitrogen.shutil, "which", fake_which)
+    monkeypatch.setattr(nitrogen.subprocess, "run", fake_run)
+
+    result = nitrogen.install_cached_publication("na", "26.1")
+
+    assert result["command_name"] == "sodium"
+    assert result["metadata"]["dependencies"] == ["wwn"]
+    assert calls[1] == ["pipx", "install", str(pub_dir), "--force"]
+
+
+def test_install_cached_publication_uses_nitropkg_name_as_command_name_when_present(tmp_path, monkeypatch):
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
     pub_dir = cache_dir / "mg26_5"
@@ -128,8 +166,37 @@ def test_install_cached_publication_ignores_nitropkg_name_and_uses_publication_n
 
     result = nitrogen.install_cached_publication("mg", "26.5")
 
-    assert result["command_name"] == "magnesium"
-    assert calls[0] == ["pipx", "uninstall", "magnesium"]
+    assert result["command_name"] == "legacy-name"
+    assert calls[0] == ["pipx", "uninstall", "legacy-name"]
+    assert calls[1] == ["pipx", "install", str(pub_dir), "--force"]
+
+
+def test_install_cached_publication_uses_nitropkg_name_as_command_name(tmp_path, monkeypatch):
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    pub_dir = cache_dir / "na26_1"
+    pub_dir.mkdir()
+    (pub_dir / ".nitropkg").write_text(json.dumps({"name": "na", "entry": "__main__.py"}), encoding="utf-8")
+    (pub_dir / "__main__.py").write_text("print('cached sodium alias run')\n", encoding="utf-8")
+
+    monkeypatch.setattr(nitrogen, "INTERNAL_WW_DIR", str(cache_dir))
+
+    calls = []
+
+    def fake_which(name):
+        return "/usr/bin/pipx" if name == "pipx" else None
+
+    def fake_run(cmd, capture_output, text, check=False, env=None):
+        calls.append(cmd)
+        return type("Result", (), {"returncode": 0})()
+
+    monkeypatch.setattr(nitrogen.shutil, "which", fake_which)
+    monkeypatch.setattr(nitrogen.subprocess, "run", fake_run)
+
+    result = nitrogen.install_cached_publication("na", "26.1")
+
+    assert result["command_name"] == "na"
+    assert calls[0] == ["pipx", "uninstall", "na"]
     assert calls[1] == ["pipx", "install", str(pub_dir), "--force"]
 
 
